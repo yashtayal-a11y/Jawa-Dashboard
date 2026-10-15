@@ -306,18 +306,15 @@ function buildSrcGroups(srcList) {
   const org = srcList.filter(s => classifySrc(s) === 'organic');
   const nms = srcList.filter(s => classifySrc(s) === 'nonms');
   const groups = [];
-  const paidSrcs = [...adw, ...fb];
+  const paidSrcs = [...adw, ...fb, ...wa];
   const orgSrcs  = [...org, ...nms];
   if (paidSrcs.length) groups.push({
     id:'paid', label:'PAID', color:'#7C3AED', lightColor:'#EDE9FE', srcs: paidSrcs,
     subGroups: [
       ...(adw.length ? [{ id:'adwords', label:'ADWORDS', color:'#7C3AED', lightColor:'#F3F0FF', srcs: adw }] : []),
       ...(fb.length  ? [{ id:'msfb',    label:'MS FB',   color:'#2563EB', lightColor:'#EFF6FF', srcs: fb  }] : []),
+      ...(wa.length  ? [{ id:'whatsapp', label:'WHATSAPP', color:'#25D366', lightColor:'#DCFCE7', srcs: wa }] : []),
     ]
-  });
-  if (wa.length) groups.push({
-    id:'whatsapp', label:'WHATSAPP', color:'#25D366', lightColor:'#DCFCE7', srcs: wa,
-    subGroups: []
   });
   if (orgSrcs.length) groups.push({
     id:'organic', label:'ORG+NON MS', color:'#059669', lightColor:'#D1FAE5', srcs: orgSrcs,
