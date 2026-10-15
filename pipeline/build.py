@@ -240,11 +240,15 @@ def main():
                      "document.getElementById('genDate').textContent = " + json.dumps('Data as of ' + today.strftime('%d %b %Y, %H:%M IST')) + ';', app, count=1)
     assert n == 1, 'genDate line not found in app.js'
     ch, cdata, capp = make_client(shell, DATA, app)
-    # the dashboard script is kept inert (text/plain) and started by auth.js once a user is signed in
-    auth = open(os.path.join(HERE, 'auth.js'), encoding='utf-8').read()
-    html = (ch + '<script>\nconst DATA = ' + json.dumps(cdata, separators=(',', ':')) + ';\n</script>\n'
-            '<script type="text/plain" id="jawa-app">\n' + capp.replace('</script', '<\\/script') + '\n</script>\n'
-            '<script>\n' + auth + '\n</script>\n</body>\n</html>')
+    data_js = json.dumps(cdata, separators=(',', ':'))
+    if os.environ.get('JAWA_AUTH', '').lower() == 'off':       # an outer login (Cloudflare Access) is in place
+        html = ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n<script>\n' + capp + '\n</script>\n</body>\n</html>'
+    else:
+        # the dashboard script is kept inert (text/plain) and started by auth.js once a user is signed in
+        auth = open(os.path.join(HERE, 'auth.js'), encoding='utf-8').read()
+        html = (ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n'
+                '<script type="text/plain" id="jawa-app">\n' + capp.replace('</script', '<\\/script') + '\n</script>\n'
+                '<script>\n' + auth + '\n</script>\n</body>\n</html>')
     os.makedirs(A.out, exist_ok=True)
     open(os.path.join(A.out, 'client.html'), 'w', encoding='utf-8').write(html)
 

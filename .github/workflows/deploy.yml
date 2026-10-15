@@ -23,6 +23,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      cf: ${{ steps.mode.outputs.cf }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,9 +46,18 @@ jobs:
             echo "no live archive yet (first run)"
           fi
 
+      - name: Choose hosting
+        id: mode
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # Cloudflare token present -> publish to Cloudflare Pages (behind Access). Otherwise GitHub Pages.
+          if [ -n "$CF_TOKEN" ]; then echo "cf=true" >> "$GITHUB_OUTPUT"; else echo "cf=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Build dashboard from Drive sheets
         env:
           JAWA_SOURCES: ${{ secrets.JAWA_SOURCES }}
+          JAWA_AUTH: ${{ vars.JAWA_AUTH }}
         run: |
           printf '%s' "$JAWA_SOURCES" > work/sources.json
           python pipeline/build.py --inputs work/inputs --live work/live.json --sources work/sources.json --out work/out
@@ -76,13 +87,25 @@ jobs:
           git pull --rebase
           git push
 
+      - name: Publish to Cloudflare Pages
+        if: steps.mode.outputs.cf == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_PROJECT: ${{ vars.CF_PROJECT }}
+        run: |
+          npx -y wrangler@4 pages deploy _site --project-name "${CF_PROJECT:-jawa-dashboard}" --branch main --commit-dirty=true
+
       - uses: actions/configure-pages@v5
+        if: steps.mode.outputs.cf != 'true'
       - uses: actions/upload-pages-artifact@v3
+        if: steps.mode.outputs.cf != 'true'
         with:
           path: _site
 
   deploy:
     needs: build
+    if: needs.build.outputs.cf != 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

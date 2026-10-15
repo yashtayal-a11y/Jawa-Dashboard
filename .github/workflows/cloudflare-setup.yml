@@ -1,0 +1,57 @@
+name: Cloudflare Access setup (one-time)
+
+# Creates the Cloudflare Pages project and puts a Cloudflare Access login in front of it.
+# Needs repo secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+# Run it once, check the lock in a private window, then run "Jawa Dashboard Refresh" to publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Cloudflare Pages project name (site will be <name>.pages.dev)"
+        default: "jawa-dashboard"
+      emails:
+        description: "Comma-separated emails allowed to sign in"
+        default: "yash.tayal@girnarsoft.com"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PROJECT: ${{ inputs.project }}
+      EMAILS: ${{ inputs.emails }}
+    steps:
+      - name: Check secrets
+        run: |
+          [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ] || { echo "::error::Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID first"; exit 1; }
+
+      - name: Create Pages project (empty, nothing published yet)
+        run: |
+          code=$(curl -s -o out.json -w '%{http_code}' -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/pages/projects" \
+            -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+            --data "{\"name\":\"$PROJECT\",\"production_branch\":\"main\"}")
+          cat out.json; echo
+          if [ "$code" != "200" ] && ! grep -q "already exists" out.json; then echo "::error::project create failed ($code)"; exit 1; fi
+          sub=$(python3 -c "import json;print(json.load(open('out.json')).get('result',{}).get('subdomain',''))" 2>/dev/null)
+          echo "DOMAIN=${sub:-$PROJECT.pages.dev}" >> "$GITHUB_ENV"
+
+      - name: Lock it with Cloudflare Access (one-time PIN to the allowed emails)
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          acc, tok, dom = os.environ['CF_ACCOUNT'], os.environ['CF_TOKEN'], os.environ['DOMAIN']
+          def call(path, body):
+              req = urllib.request.Request(f"https://api.cloudflare.com/client/v4/accounts/{acc}{path}", data=json.dumps(body).encode(),
+                    headers={'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'}, method='POST')
+              try: return json.load(urllib.request.urlopen(req))
+              except urllib.error.HTTPError as e: raise SystemExit(f"{path}: {e.code} {e.read().decode()}")
+          app = call('/access/apps', {'name': 'Jawa Dashboard', 'type': 'self_hosted', 'domain': dom, 'session_duration': '24h',
+                                      'self_hosted_domains': [dom, '*.' + dom], 'app_launcher_visible': False})
+          aid = app['result']['id']
+          emails = [e.strip() for e in os.environ['EMAILS'].split(',') if e.strip()]
+          call(f'/access/apps/{aid}/policies', {'name': 'Approved', 'decision': 'allow', 'precedence': 1,
+                                                'include': [{'email': {'email': e}} for e in emails]})
+          print('Access app', aid, 'created for', dom, 'allowing', emails)
+          PY
