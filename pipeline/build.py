@@ -257,6 +257,17 @@ def main():
             p_ret[x['lid']] = {'rtype': 'DMS' if x['rsrc'] == 'DMS' else 'Call Out', 'rm': x['pm'], 'pm': x['rm'], 'rd': x.get('rd', '')}
     built_iso = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=5, minutes=30)).isoformat()
     payload = build_payload(p_leads, p_ret, built_iso)
+    # Unique-leads version: one enquiry per customer (mobile): the retailing enquiry if there is one, else the earliest.
+    by_mob = {}
+    for x, pl in zip(allrows, p_leads):
+        by_mob.setdefault(x['mob'], []).append((x, pl))
+    u_leads, u_ret = [], {}
+    for lst in by_mob.values():
+        rep_x, rep_pl = next(((x, pl) for x, pl in lst if x['rm']), None) or min(lst, key=lambda t: t[0]['date'])
+        u_leads.append(rep_pl)
+        if rep_x['rm']: u_ret[rep_x['lid']] = p_ret[rep_x['lid']]
+    payload_u = build_payload(u_leads, u_ret, built_iso)
+    log(f"new-view unique payload: {len(u_leads):,} customers, {len(u_ret):,} retailed")
     log(f"new-view payload: {len(p_leads):,} leads, {len(p_ret):,} retails, ageing {payload['ram_meta']}")
 
     # ---- 6. render (client copy: Source / Lead Type already collapsed above)
@@ -294,6 +305,8 @@ def main():
     os.makedirs(os.path.join(A.out, 'data'), exist_ok=True)
     with gzip.open(os.path.join(A.out, 'data', 'jawa_payload.json.gz'), 'wt', encoding='utf-8', compresslevel=6) as fh:
         json.dump(payload, fh, separators=(',', ':'))
+    with gzip.open(os.path.join(A.out, 'data', 'jawa_payload_unique.json.gz'), 'wt', encoding='utf-8', compresslevel=6) as fh:
+        json.dump(payload_u, fh, separators=(',', ':'))
     newapp = open(os.path.join(HERE, 'new_app.html'), encoding='utf-8').read().replace('__BUILD_ID__', build_id)
     open(os.path.join(A.out, 'new.html'), 'w', encoding='utf-8').write(newapp)
 

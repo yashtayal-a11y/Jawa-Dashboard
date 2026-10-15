@@ -180,6 +180,7 @@ tr.dealer-row:hover td{background:#FEF3C7}
    ════════════════════════════════════════════════════════════════════ */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxpSAY5rtnfCT92KTciIrWmraLOOJ_ZKE7Jrq3S9WWOsFSdjDGsZTXLGHZlnWawU7hu/exec';
 const DATA_URL = './data/jawa_payload.json.gz?b=__BUILD_ID__';
+const DATA_URL_UNIQUE = './data/jawa_payload_unique.json.gz?b=__BUILD_ID__';
 const CACHE_KEY = 'jawa_ldr_v1_cache';
 
 /* ════════════════════════════════════════════════════════════════════
@@ -337,9 +338,9 @@ const { useState, useEffect, useMemo, useRef, useCallback, useTransition } = Rea
 /* ════════════════════════════════════════════════════════════════════
    DATA FETCHING
    ════════════════════════════════════════════════════════════════════ */
-async function fetchData() {
+async function fetchData(url) {
   let resp;
-  try { resp = await fetch(DATA_URL, { cache: 'no-store' }); }
+  try { resp = await fetch(url || DATA_URL, { cache: 'no-store' }); }
   catch (e) { throw new Error('Network error: ' + e.message); }
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   const ds = new DecompressionStream('gzip');
@@ -3635,6 +3636,7 @@ function App() {
   const [err, setErr]             = useState(null);
   const [isPending, startT]       = useTransition();
   const [leadsMode, setLeadsMode] = useState('update');
+  const [uniq, setUniq]         = useState(true);   // unique leads only (default)
   const [RT, setRT]               = useState('all');
   const [filters, setFilters]     = useState({ months:new Set(), leadTypes:new Set(), sources:new Set(), models:new Set(), states:new Set(), cities:new Set(), purchasedModels:new Set() });
   const [fontSize, setFontSize] = useState(_initFS);
@@ -3668,14 +3670,14 @@ function App() {
   const doFetch = useCallback(async () => {
     setLoading(true); setErr(null);
     try {
-      const parsed = await fetchData();
+      const parsed = await fetchData(uniq ? DATA_URL_UNIQUE : DATA_URL);
       setData(parsed);
       try { localStorage.setItem(CACHE_KEY+'_t', parsed.t); } catch(e) {}
     } catch(e) { setErr(e.message); }
     finally { setLoading(false); }
-  }, []);
+  }, [uniq]);
 
-  useEffect(() => { if (auth && (auth.role === 'full' || auth.role === 'viewer' || auth.role === 'admin')) doFetch(); }, [auth && auth.role]);
+  useEffect(() => { if (auth && (auth.role === 'full' || auth.role === 'viewer' || auth.role === 'admin')) doFetch(); }, [auth && auth.role, uniq]);
 
   // ── Derived data ───────────────────────────────────────────────────
   const effectiveData = useMemo(() => {
@@ -3826,6 +3828,8 @@ function App() {
             syncChip,
           ),
           ce('div', { style:{display:'flex',gap:8,alignItems:'center'} },
+            ce('label', { className:'fs-10', title:'Count each customer once (by mobile number): one enquiry per customer, the retailing one if any', style:{display:'flex',alignItems:'center',gap:6,background:'#F1F5F9',border:'1px solid #E2E8F0',borderRadius:20,padding:'4px 12px',fontWeight:700,color:'#475569',cursor:'pointer'} },
+              ce('input', { type:'checkbox', checked:uniq, onChange:e=>setUniq(e.target.checked) }), 'Unique leads only'),
             ce('div', { style:{display:'flex',alignItems:'center',background:'#F1F5F9',borderRadius:20,padding:'2px',border:'1px solid #E2E8F0',gap:2} },
               ce('button', {
                 onClick:()=>setLeadsMode('create'),
