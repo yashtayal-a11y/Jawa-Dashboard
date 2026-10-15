@@ -1,34 +1,96 @@
-﻿name: Deploy Jawa Performance Dashboard
+name: Jawa Dashboard Refresh
 
 on:
+  schedule:
+    # 10:00 and 16:00 IST. Scheduled runs can lag by hours, so there are two a day.
+    - cron: "30 4 * * *"
+    - cron: "30 10 * * *"
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
+    paths: ["pipeline/**", ".github/workflows/deploy.yml"]
+
+concurrency:
+  group: jawa-refresh
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write      # state release assets + keep-alive commit
   pages: write
   id-token: write
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare site
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch private state (encrypted release assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JAWA_STATE_KEY: ${{ secrets.JAWA_STATE_KEY }}
         run: |
+          mkdir -p work/inputs
+          gh release download jawa-state --pattern inputs.enc --dir work
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:JAWA_STATE_KEY -in work/inputs.enc | tar xz -C work/inputs
+          if gh release download jawa-state --pattern live.enc --dir work 2>/dev/null; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:JAWA_STATE_KEY -in work/live.enc | gunzip > work/live.json
+          else
+            echo "no live archive yet (first run)"
+          fi
+
+      - name: Build dashboard from Drive sheets
+        env:
+          JAWA_SOURCES: ${{ secrets.JAWA_SOURCES }}
+        run: |
+          printf '%s' "$JAWA_SOURCES" > work/sources.json
+          python pipeline/build.py --inputs work/inputs --live work/live.json --sources work/sources.json --out work/out
+          rm -f work/sources.json
+
+      - name: Password-protect
+        env:
+          JAWA_PASSWORD: ${{ secrets.JAWA_PASSWORD }}
+        run: |
+          npx -y staticrypt@3.5.4 work/out/client.html -p "$JAWA_PASSWORD" -d work/enc --short --remember 7 \
+            --template-title "Jawa Performance Dashboard" --template-instructions "Enter the password to view the dashboard."
           mkdir -p _site
-          cp index.html _site/index.html
-      - uses: actions/configure-pages@v4
+          cp work/enc/client.html _site/index.html
+          ls -la _site
+
+      - name: Save live archive (encrypted)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JAWA_STATE_KEY: ${{ secrets.JAWA_STATE_KEY }}
+        run: |
+          gzip -c work/live.json | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:JAWA_STATE_KEY -out work/live.enc
+          gh release upload jawa-state work/live.enc --clobber
+
+      - name: Keep repo active
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "Last run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > last_run.txt
+          git add last_run.txt
+          git diff --cached --quiet || git commit -m "chore: refresh $(date -u '+%Y-%m-%d %H:%M')"
+          git pull --rebase
+          git push
+
+      - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
