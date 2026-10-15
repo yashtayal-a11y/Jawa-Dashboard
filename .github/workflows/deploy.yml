@@ -67,6 +67,7 @@ jobs:
         run: |
           mkdir -p _site
           cp work/out/client.html _site/index.html
+          cp work/out/version.json _site/version.json
           ls -la _site
 
       - name: Save live archive (encrypted)

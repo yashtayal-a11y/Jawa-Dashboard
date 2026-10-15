@@ -240,15 +240,21 @@ def main():
                      "document.getElementById('genDate').textContent = " + json.dumps('Data as of ' + today.strftime('%d %b %Y, %H:%M IST')) + ';', app, count=1)
     assert n == 1, 'genDate line not found in app.js'
     ch, cdata, capp = make_client(shell, DATA, app)
+    auth_on = os.environ.get('JAWA_AUTH', '').lower() != 'off'
+    build_id = today.strftime('%Y%m%d%H%M%S'); built = today.strftime('%d %b %H:%M IST')
+    repo = os.environ.get('GITHUB_REPOSITORY', 'yashtayal-a11y/Jawa-Dashboard')
+    rjs = (open(os.path.join(HERE, 'refresh.js'), encoding='utf-8').read().replace('__BUILD_ID__', build_id).replace('__BUILT__', built)
+           .replace('__RUN_URL__', f'https://github.com/{repo}/actions/workflows/deploy.yml').replace('__AUTH_ON__', 'true' if auth_on else 'false'))
+    REFRESH = '<script>\n' + rjs + '\n</script>\n'
     data_js = json.dumps(cdata, separators=(',', ':'))
-    if os.environ.get('JAWA_AUTH', '').lower() == 'off':       # an outer login (Cloudflare Access) is in place
-        html = ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n<script>\n' + capp + '\n</script>\n</body>\n</html>'
+    if not auth_on:                                            # an outer login (Cloudflare Access) is in place
+        html = ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n<script>\n' + capp + '\n</script>\n' + REFRESH + '</body>\n</html>'
     else:
         # the dashboard script is kept inert (text/plain) and started by auth.js once a user is signed in
         auth = open(os.path.join(HERE, 'auth.js'), encoding='utf-8').read()
         html = (ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n'
                 '<script type="text/plain" id="jawa-app">\n' + capp.replace('</script', '<\\/script') + '\n</script>\n'
-                '<script>\n' + auth + '\n</script>\n</body>\n</html>')
+                '<script>\n' + auth + '\n</script>\n' + REFRESH + '</body>\n</html>')
     os.makedirs(A.out, exist_ok=True)
     open(os.path.join(A.out, 'client.html'), 'w', encoding='utf-8').write(html)
 
@@ -269,6 +275,7 @@ def main():
         log(f"{m:14}{agg[m][0]:9,}{agg[m][1]:14,}{agg[m][2]:14,}{agg[m][3]:7,}")
     json.dump({'built_ist': today.strftime('%Y-%m-%d %H:%M'), 'leads': len(rows), 'months': months[-1]},
               open(os.path.join(A.out, 'summary.json'), 'w'))
+    json.dump({'id': build_id, 'built': built}, open(os.path.join(A.out, 'version.json'), 'w'))
 
 
 if __name__ == '__main__':
