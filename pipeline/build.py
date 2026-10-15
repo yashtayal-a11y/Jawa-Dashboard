@@ -22,6 +22,8 @@ from collections import Counter, defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from make_client import make_client
+import gzip
+from payload import build_payload
 
 MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 LIVE_FROM = "May'26"
@@ -81,7 +83,8 @@ def parse_leads(rows, salt):
         model = s(r.get('model')); model = ALIAS.get(model, model) or 'Unspecified'
         dealer = norm_dealer(r.get('oem_crm_id')) or norm_dealer(r.get('verified_dealer'))
         rec = [lm, model, dealer, s(r.get('Dealer_Name')), s(r.get('City')), s(r.get('State')), s(r.get('Status_Name')),
-               hashlib.sha256((salt + mob).encode()).hexdigest()[:20] if mob else '', date or 'Unknown', s(r.get('updateTime'))]
+               hashlib.sha256((salt + mob).encode()).hexdigest()[:20] if mob else '', date or 'Unknown', s(r.get('updateTime')),
+               s(r.get('lead_type')) or 'Unknown', s(r.get('Medium')), s(r.get('utm_campaign'))]
         old = out.get(eid)
         if old is None or rec[9] > old[9]: out[eid] = rec
     return out
@@ -97,10 +100,19 @@ def parse_retails(rows):
         pm = norm_month(r.get('Performance Month')) or norm_month(r.get('performanceMonth'))
         rec = {'model': model, 'pm': pm, 'src': 'DMS' if s(r.get('Call Type')).upper() == 'DMS' else 'VOC',
                'cm': norm_month(r.get('Create Month')) or norm_month(r.get('createTime')),
-               'org': s(r.get('Organization')), 'att': s(r.get('Retail_Attribution_Date'))}
+               'org': s(r.get('Organization')), 'att': s(r.get('Retail_Attribution_Date')), 'rd': s(r.get('Retail_Date'))[:10]}
         old = out.get(eid)
         if old is None or rec['att'] > old['att']: out[eid] = rec
     return out
+
+
+MEDIUM_FALLBACK = {'Organic': 'Organic', 'Facebook': 'Facebook', 'Google': 'Google', 'Non-MS': 'Non CPS', 'Whatsapp': 'WhatsApp'}
+def derive_source(medium, lt, camp, table):
+    """Source as the FY master labels it. The sheets only carry Medium, so this extends the master's own attribution to
+    new leads by matching on (Medium, lead type, campaign) learned from leads present in both (about 90% agreement)."""
+    for k in (f"{medium}|{lt}|{camp}", f"{medium}|{lt}"):
+        if k in table: return table[k]
+    return MEDIUM_FALLBACK.get(medium, medium or 'Unknown')
 
 
 def status_class(st, mp):
@@ -170,10 +182,13 @@ def main():
         allrows.append({'lm': F['months'][r[0]], 'model': F['models'][r[1]], 'dealer': norm_dealer(F['dealers'][r[2]]),
                         'sc': F['statuscats'][r[3]], 'q': F['qualstatus'][r[4]], 'cs': F['currstatus'][r[5]], 'mob': r[7],
                         'date': F['dates'][r[8]], 'rm': F['retailModels'][r[9]] if r[9] >= 0 else '',
-                        'pm': F['months'][r[10]] if r[10] >= 0 else '', 'rsrc': {0: 'DMS', 1: 'VOC'}.get(r[11], '') if r[6] else ''})
+                        'pm': F['months'][r[10]] if r[10] >= 0 else '', 'rsrc': {0: 'DMS', 1: 'VOC'}.get(r[11], '') if r[6] else '',
+                        'lid': 'F%d' % len(allrows), 'src': ('WhatsApp' if F['sources'][r[12]] == 'CTWA' else F['sources'][r[12]]) if len(r) > 13 else 'Unknown',
+                        'lt': F['leadtypes'][r[13]] if len(r) > 13 else 'Unknown', 'rd': ''})
     used = set(); nlive = 0
     for eid, rec in leads.items():
-        lm, model, dealer, dname, city, state, st, mh, date, upd = rec
+        lm, model, dealer, dname, city, state, st, mh, date, upd = rec[:10]
+        ltype, medium, camp = (rec[10:13] + ['', '', ''])[:3] if len(rec) >= 13 else ('Unknown', '', '')
         if mh:
             if mh not in mob_idx: mob_idx[mh] = next_idx; live.setdefault('newmob', {})[mh] = next_idx; next_idx += 1
             mob = mob_idx[mh]
@@ -181,11 +196,12 @@ def main():
             mob = next_idx; next_idx += 1                                 # no mobile: never merge with another lead
         cat, q = status_class(st, maps['status'])
         row = {'lm': lm, 'model': model, 'dealer': dealer, 'sc': cat, 'q': q, 'cs': st, 'mob': mob, 'date': date,
-               'rm': '', 'pm': '', 'rsrc': ''}
+               'rm': '', 'pm': '', 'rsrc': '', 'lid': eid, 'src': derive_source(medium, ltype, camp, maps.get('source', {})),
+               'lt': ltype, 'rd': '', 'dname': dname, 'city': city, 'state': state}
         rt = retails.get(eid)
         if rt:
             used.add(eid)
-            row.update(rm=rt['model'] or model, pm=rt['pm'], rsrc=rt['src'])
+            row.update(rm=rt['model'] or model, pm=rt['pm'], rsrc=rt['src'], rd=rt['rd'])
         allrows.append(row); nlive += 1
     # retails whose lead is not in Drive: new-month ones become retail-only rows, older ones belong to frozen leads
     orphan_new = orphan_frozen = 0
@@ -197,7 +213,8 @@ def main():
             if code == 'UNKNOWN' and 'UNKNOWN' not in fmeta: fmeta['UNKNOWN'] = [rt['org'] or 'Unknown dealer', 'Unknown', 'Unknown', 'ROI', None, 0]
             allrows.append({'lm': rt['cm'], 'model': rt['model'] or 'Unspecified', 'dealer': code, 'sc': 'Converted',
                             'q': 'Qualified', 'cs': 'Retail Attribution', 'mob': next_idx, 'date': 'Unknown',
-                            'rm': rt['model'], 'pm': rt['pm'], 'rsrc': rt['src']})
+                            'rm': rt['model'], 'pm': rt['pm'], 'rsrc': rt['src'], 'lid': eid, 'src': 'Unknown', 'lt': 'Unknown',
+                            'rd': rt['rd']})
             next_idx += 1; orphan_new += 1
         else:
             orphan_frozen += 1
@@ -226,6 +243,22 @@ def main():
             'currstatus': css, 'dealers': dealers, 'dealerMeta': meta, 'dates': dates, 'rows': rows, 'retailModels': rms,
             'retailSources': ['DMS', 'VOC', '']}
 
+    # ---- 5b. payload for the New view (TVS-format lead-disposition payload)
+    def dealer_info(x):
+        m = fmeta.get(x['dealer'])
+        if m: return m[0], m[1], m[2]
+        return x.get('dname') or x['dealer'], x.get('city') or 'Unknown', x.get('state') or 'Unknown'
+    p_leads, p_ret = [], {}
+    for x in allrows:
+        dn, ci, stt = dealer_info(x)
+        p_leads.append({'lid': x['lid'], 'lm': x['lm'], 'src': x['src'], 'lt': x['lt'], 'mdl': x['model'], 'st': stt, 'city': ci,
+                        'cd': x['date'], 'dl': dn, 'sn': x['cs']})
+        if x['rm']:
+            p_ret[x['lid']] = {'rtype': 'DMS' if x['rsrc'] == 'DMS' else 'Call Out', 'rm': x['pm'], 'pm': x['rm'], 'rd': x.get('rd', '')}
+    built_iso = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=5, minutes=30)).isoformat()
+    payload = build_payload(p_leads, p_ret, built_iso)
+    log(f"new-view payload: {len(p_leads):,} leads, {len(p_ret):,} retails, ageing {payload['ram_meta']}")
+
     # ---- 6. render (client copy: Source / Lead Type already collapsed above)
     shell = open(I('shell.html'), encoding='utf-8').read(); app = open(I('app.js'), encoding='utf-8').read()
     clpl = {k: v for k, v in json.load(open(I('clpl_retails.json'))).items() if not k.startswith('_')}
@@ -245,7 +278,8 @@ def main():
     repo = os.environ.get('GITHUB_REPOSITORY', 'yashtayal-a11y/Jawa-Dashboard')
     rjs = (open(os.path.join(HERE, 'refresh.js'), encoding='utf-8').read().replace('__BUILD_ID__', build_id).replace('__BUILT__', built)
            .replace('__RUN_URL__', f'https://github.com/{repo}/actions/workflows/deploy.yml').replace('__AUTH_ON__', 'true' if auth_on else 'false'))
-    REFRESH = '<script>\n' + rjs + '\n</script>\n'
+    tjs = open(os.path.join(HERE, 'toggle.js'), encoding='utf-8').read()
+    REFRESH = '<script>\n' + rjs + '\n</script>\n<script>\n' + tjs + '\n</script>\n'
     data_js = json.dumps(cdata, separators=(',', ':'))
     if not auth_on:                                            # an outer login (Cloudflare Access) is in place
         html = ch + '<script>\nconst DATA = ' + data_js + ';\n</script>\n<script>\n' + capp + '\n</script>\n' + REFRESH + '</body>\n</html>'
@@ -257,6 +291,11 @@ def main():
                 '<script>\n' + auth + '\n</script>\n' + REFRESH + '</body>\n</html>')
     os.makedirs(A.out, exist_ok=True)
     open(os.path.join(A.out, 'client.html'), 'w', encoding='utf-8').write(html)
+    os.makedirs(os.path.join(A.out, 'data'), exist_ok=True)
+    with gzip.open(os.path.join(A.out, 'data', 'jawa_payload.json.gz'), 'wt', encoding='utf-8', compresslevel=6) as fh:
+        json.dump(payload, fh, separators=(',', ':'))
+    newapp = open(os.path.join(HERE, 'new_app.html'), encoding='utf-8').read().replace('__BUILD_ID__', build_id)
+    open(os.path.join(A.out, 'new.html'), 'w', encoding='utf-8').write(newapp)
 
     live['leads'] = leads
     json.dump(live, open(A.live, 'w'), separators=(',', ':'))
