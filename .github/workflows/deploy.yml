@@ -68,13 +68,9 @@ jobs:
           mkdir -p _site
           cp work/out/client.html _site/index.html
           cp work/out/version.json _site/version.json
-          # The New dashboards carry Source / Lead Type data: publish them only behind Cloudflare Access.
-          if [ "${{ steps.mode.outputs.cf }}" = "true" ]; then
-            cp work/out/new.html _site/new.html
-            mkdir -p _site/data && cp work/out/data/jawa_payload.json.gz _site/data/
-          else
-            echo "New dashboards not published (no Cloudflare Access yet)"
-          fi
+          # The New dashboards carry Source / Lead Type data. Published on the current (public) site by choice.
+          cp work/out/new.html _site/new.html
+          mkdir -p _site/data && cp work/out/data/jawa_payload.json.gz _site/data/
           ls -laR _site | head -20
 
       - name: Save live archive (encrypted)
