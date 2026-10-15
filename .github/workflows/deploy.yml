@@ -52,14 +52,10 @@ jobs:
           python pipeline/build.py --inputs work/inputs --live work/live.json --sources work/sources.json --out work/out
           rm -f work/sources.json
 
-      - name: Password-protect
-        env:
-          JAWA_PASSWORD: ${{ secrets.JAWA_PASSWORD }}
+      - name: Prepare site
         run: |
-          npx -y staticrypt@3.5.4 work/out/client.html -p "$JAWA_PASSWORD" -d work/enc --short --remember 7 \
-            --template-title "Jawa Performance Dashboard" --template-instructions "Enter the password to view the dashboard."
           mkdir -p _site
-          cp work/enc/client.html _site/index.html
+          cp work/out/client.html _site/index.html
           ls -la _site
 
       - name: Save live archive (encrypted)
