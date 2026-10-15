@@ -1592,9 +1592,8 @@ const ModelSourceTab = React.memo(function ModelSourceTab({ data, filters, month
     for (const row of pmr) {
       const pmi = row[0], mi = row[1], si = row[2], li = row[3];
       const R = row[4], Rd = row[5], Rc = row[6];
-      if (pmi !== mi) continue;                          // loyal rows only: pmi must equal mi
-      if (selPmiSet && !selPmiSet.has(pmi)) continue;
-      const k = pmi+'|'+si+'|'+li;
+      if (selPmiSet && !selPmiSet.has(pmi)) continue;   // optional Purch. Model filter
+      const k = mi+'|'+si+'|'+li;                        // retail credited to the enquired model, so totals tie to the Overview
       const e = m.get(k)||[0,0,0]; e[0]+=R; e[1]+=Rd; e[2]+=Rc; m.set(k,e);
     }
     return m;
