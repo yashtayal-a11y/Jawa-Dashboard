@@ -277,10 +277,12 @@ def main():
             p_ret[x['lid']] = {'rtype': 'DMS' if x['rsrc'] == 'DMS' else 'Call Out', 'rm': x['pm'], 'pm': x['rm'], 'rd': x.get('rd', ''), 'ad': x.get('ad', '')}
     built_iso = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=5, minutes=30)).isoformat()
     payload = build_payload(p_leads, p_ret, built_iso)
-    # Unique-leads version: one enquiry per customer (mobile): the retailing enquiry if there is one, else the earliest.
+    # Unique-leads version: one enquiry per customer (mobile) per lead month, as the Old view does with a single month
+    # selected: the retailing enquiry if there is one, else the earliest created. A customer who enquires in two
+    # different months counts once in each of them.
     by_mob = {}
     for x, pl in zip(allrows, p_leads):
-        by_mob.setdefault(x['mob'], []).append((x, pl))
+        by_mob.setdefault((x['mob'], x['lm']), []).append((x, pl))   # unique per customer per lead month
     u_leads, u_ret = [], {}
     for lst in by_mob.values():
         rep_x, rep_pl = next(((x, pl) for x, pl in lst if x['rm']), None) or min(lst, key=lambda t: t[0]['date'])
