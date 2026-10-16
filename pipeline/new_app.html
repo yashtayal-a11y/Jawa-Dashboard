@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -2474,7 +2474,7 @@ function AdminPanel({ auth, onLogout, onViewDashboard }) {
     ),
     ce('div', { style:{display:'flex',alignItems:'center',gap:10} },
       ce('div', { className:'user-chip' },
-        ce('div', { className:'user-avatar' }, auth.email[0].toUpperCase()),
+        ce('div', { className:'user-avatar' }, (auth.email || 'J')[0].toUpperCase()),
         ce('span', { className:'user-name' }, auth.email),
         ce('span', { className:'user-role-badge role-admin' }, 'Admin'),
       ),
@@ -3594,8 +3594,241 @@ const ModelPerfTab = React.memo(function ModelPerfTab({ data, filters, months, R
 /* ════════════════════════════════════════════════════════════════════
    APP ROOT
    ════════════════════════════════════════════════════════════════════ */
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+   DAY ON DAY TAB  — leads per lead-creation day; retails stacked DMS / VOC (Call Out)
+   On Create : retails of the leads created that day (data.dd  = [day, mdl, src, lt, L, R, R_dms, R_co])
+   On Update : retails counted on the day they were ATTRIBUTED (data.ddu = [day, mdl, src, lt, R, R_dms, R_co]),
+               leads still on their creation day — the same On Update logic as the rest of the dashboard.
+   day = YYYYMMDD ; YYYYMM00 = "no day recorded" for that month (kept so month totals always reconcile).
+   State / City / Purchased-model filters do not exist in these tables.
+   â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leadsMode }) {
+  const { maps } = data;
+  const dd  = data.dd  || [];
+  const ddu = data.ddu || [];
+  const upd = leadsMode === 'update';
+  const chartRef = useRef(); const chartInst = useRef();
+  const WD = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+  // Month choices follow the global Month filter (newest first); the picker below moves within them.
+  const opts = useMemo(() => (months || []).filter(m => m && m !== '\x00'), [months]);
+  const [sel, setSel] = useState(opts[0] || '');
+  useEffect(() => { if (opts.length && !opts.includes(sel)) setSel(opts[0]); }, [opts]);
+  const idx = opts.indexOf(sel);
+
+  const view = useMemo(() => {
+    const mt = (sel || '').match(/([A-Za-z]+)'(\d+)/);
+    if (!mt || !dd.length) return null;
+    const year = 2000 + parseInt(mt[2], 10), mon = MONTHS.indexOf(mt[1]) + 1;
+    if (mon < 1) return null;
+    const ym = year * 100 + mon, dim = new Date(year, mon, 0).getDate();
+    const allMdl = !filters.models    || filters.models.size    === 0;
+    const allSrc = !filters.sources   || filters.sources.size   === 0;
+    const allLT  = !filters.leadTypes || filters.leadTypes.size === 0;
+    const keep = row => Math.floor(row[0] / 100) === ym
+      && (allMdl || filters.models.has(maps.mdl[row[1]]))
+      && (allSrc || filters.sources.has(maps.src[row[2]]))
+      && (allLT  || filters.leadTypes.has(maps.lt[row[3]]));
+    const L = new Array(dim).fill(0), Rd = new Array(dim).fill(0), Rc = new Array(dim).fill(0);
+    let uL = 0, uRd = 0, uRc = 0;                       // "no day recorded" parts of the month
+    for (const row of dd) {
+      if (!keep(row)) continue;
+      const d = row[0] % 100;
+      if (d === 0 || d > dim) { uL += row[4]; if (!upd) { uRd += row[6]; uRc += row[7]; } continue; }
+      L[d - 1] += row[4];
+      if (!upd) { Rd[d - 1] += row[6]; Rc[d - 1] += row[7]; }
+    }
+    if (upd) {
+      for (const row of ddu) {
+        if (!keep(row)) continue;
+        const d = row[0] % 100;
+        if (d === 0 || d > dim) { uRd += row[5]; uRc += row[6]; continue; }
+        Rd[d - 1] += row[5]; Rc[d - 1] += row[6];
+      }
+    }
+    const showD = RT !== 'co', showC = RT !== 'dms';
+    let last = 0;
+    for (let i = 0; i < dim; i++) if (L[i] > 0 || Rd[i] > 0 || Rc[i] > 0) last = i + 1;
+    const days = [];
+    for (let i = 0; i < dim; i++) {
+      const rd = showD ? Rd[i] : 0, rc = showC ? Rc[i] : 0;
+      days.push({ d: i + 1, wd: WD[new Date(year, mon - 1, i + 1).getDay()], l: L[i], rd, rc, r: rd + rc,
+                  l2r: L[i] > 0 ? (rd + rc) / L[i] * 100 : 0 });
+    }
+    const shown = days.slice(0, Math.max(last, 1));
+    const dL  = shown.reduce((s, x) => s + x.l, 0);
+    const dRd = shown.reduce((s, x) => s + x.rd, 0), dRc = shown.reduce((s, x) => s + x.rc, 0);
+    const nRd = showD ? uRd : 0, nRc = showC ? uRc : 0, uR = nRd + nRc;     // no-day retails
+    const tL = dL + uL, tRd = dRd + nRd, tRc = dRc + nRc, tR = tRd + tRc;   // month totals incl. no-day
+    const peak = shown.reduce((b, x) => (x.l > b.l ? x : b), shown[0]);
+    return { year, mon, dim, days, shown, last, uL, uR, nRd, nRc, dL, dR: dRd + dRc, tL, tR, tRd, tRc, peak,
+             avgL: last ? dL / last : 0, l2r: tL > 0 ? tR / tL * 100 : 0 };
+  }, [dd, ddu, sel, filters, RT, maps, upd]);
+
+  useEffect(() => {
+    const canvas = chartRef.current;
+    if (!canvas || !window.Chart || !view || view.last === 0) return;
+    if (chartInst.current) { try { chartInst.current.destroy(); } catch (e) {} }
+    const D = view.days;
+    chartInst.current = new Chart(canvas, {
+      type: 'bar',
+      data: {
+        labels: D.map(x => String(x.d)),
+        datasets: [
+          { label: 'Leads', data: D.map(x => x.l), backgroundColor: '#5A3E1A2a', borderColor: '#5A3E1A', borderWidth: 1.5, borderRadius: 3, stack: 'leads', yAxisID: 'y' },
+          { label: 'Retail — DMS', data: D.map(x => x.rd), backgroundColor: '#B8741A80', borderColor: '#B8741A', borderWidth: 1.5, borderRadius: 3, stack: 'retail', yAxisID: 'y' },
+          { label: 'Retail — VOC (Call Out)', data: D.map(x => x.rc), backgroundColor: '#7C3AED80', borderColor: '#7C3AED', borderWidth: 1.5, borderRadius: 3, stack: 'retail', yAxisID: 'y' },
+          { label: 'L2R%', data: D.map(x => parseFloat(x.l2r.toFixed(2))), type: 'line', borderColor: '#F5A623', backgroundColor: 'transparent', borderWidth: 2.5, pointRadius: 4, pointBackgroundColor: '#F5A623', yAxisID: 'y2', tension: .3 },
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'top', labels: { boxWidth: 10, boxHeight: 10, font: { size: 10, family: 'DM Mono,monospace' }, color: '#475569' } },
+          tooltip: {
+            backgroundColor: 'rgba(11,22,41,.92)', titleColor: '#EFE2C8', bodyColor: '#D9BE8A', footerColor: '#FDE68A', padding: 10, cornerRadius: 8,
+            callbacks: {
+              title: items => { const x = D[items[0].dataIndex]; return x.d + ' ' + MONTHS[view.mon - 1] + ' ' + view.year + ' (' + x.wd + ')'; },
+              footer: items => { const x = D[items[0].dataIndex]; return 'Total retail: ' + Nf(x.r); },
+            }
+          },
+        },
+        scales: {
+          x: { stacked: true, grid: { color: 'rgba(100,116,139,.1)' }, ticks: { color: '#475569', font: { size: 10 } }, title: { display: true, text: 'Day of month', color: '#94a3b8', font: { size: 9 } } },
+          y: { stacked: true, grid: { color: 'rgba(100,116,139,.1)' }, ticks: { color: '#475569', font: { size: 10 } }, position: 'left', beginAtZero: true, title: { display: true, text: 'Volume', color: '#94a3b8', font: { size: 9 } } },
+          y2: { stacked: false, position: 'right', ticks: { color: '#F5A623', font: { size: 10 }, callback: v => v + '%' }, grid: { display: false }, title: { display: true, text: 'L2R%', color: '#F5A623', font: { size: 9 } }, beginAtZero: true },
+        }
+      }
+    });
+    return () => { try { if (chartInst.current) chartInst.current.destroy(); } catch (e) {} };
+  }, [view]);
+
+  if (!dd.length) return ce('div', { className: 'fs-14', style: { textAlign: 'center', padding: 60, color: '#94A3B8' } },
+    ce('div', { className: 'fs-32', style: { marginBottom: 12 } }, '📅'), 'Day-on-day data will appear after the next pipeline run.');
+  if (!opts.length || !view) return ce('div', { className: 'fs-14', style: { textAlign: 'center', padding: 60, color: '#94A3B8' } },
+    'No month selected — pick at least one month in the Month filter above.');
+
+  const filtersNA = [(filters.states && filters.states.size), (filters.cities && filters.cities.size), (filters.purchasedModels && filters.purchasedModels.size)].some(n => n > 0);
+
+  const exportData = () => {
+    const aoa = [['Date', 'Day', 'Leads (created)', 'Retail DMS', 'Retail VOC (Call Out)', 'Total Retail', 'L2R%']];
+    for (const x of view.shown) aoa.push([x.d + ' ' + MONTHS[view.mon - 1] + ' ' + view.year, x.wd, x.l, x.rd, x.rc, x.r, +x.l2r.toFixed(2)]);
+    if (view.uL > 0 || view.uR > 0) aoa.push(['No day recorded', '', view.uL, view.nRd, view.nRc, view.uR, '']);
+    aoa.push(['∑ Total', '', view.tL, view.tRd, view.tRc, view.tR, +view.l2r.toFixed(2)]);
+    exportXlsx({ ['Day on Day ' + sel + (upd ? ' OU' : ' OC')]: aoa }, 'Jawa_DayOnDay_' + sel.replace("'", '') + (upd ? '_OnUpdate' : '_OnCreate'));
+  };
+
+  const navBtn = (label, disabled, onClick) => ce('button', {
+    className: 'btn btn-secondary', disabled, onClick,
+    style: { fontSize: 12, padding: '4px 12px', opacity: disabled ? .4 : 1, cursor: disabled ? 'default' : 'pointer' }
+  }, label);
+
+  const navCard = (withExport) => ce('div', { className: 'card', style: { padding: '12px 18px', marginBottom: 14, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+      ce('div', { className: 'fs-10', style: { fontWeight: 700, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '.06em' } }, 'Month'),
+      navBtn('◀', idx >= opts.length - 1, () => setSel(opts[idx + 1])),
+      ce('select', { value: sel, onChange: e => setSel(e.target.value),
+        style: { fontSize: 13, fontWeight: 700, padding: '5px 10px', borderRadius: 8, border: '1px solid #CBD5E1', background: '#fff', color: '#0f172a', fontFamily: 'inherit' } },
+        opts.map(m => ce('option', { key: m, value: m }, m))),
+      navBtn('▶', idx <= 0, () => setSel(opts[idx - 1])),
+      ce('div', { style: { marginLeft: 'auto' } }, withExport ? ce(ExportBtn, { onClick: exportData }) : null)
+    );
+
+  const noteBar = ce('div', { style: { fontSize: 12, color: '#64748B', marginBottom: 14, padding: '8px 12px', background: '#F8FAFC', borderRadius: 8, border: '1px solid #E2E8F0' } },
+      (upd
+        ? '📅 On Update: leads are counted on the day they were created; retails on the day they were attributed (attribution date), so the month total matches the Overview. '
+        : '📅 On Create: leads are counted on the day they were created and retails are attributed to that creation day (recent days keep converting, so their L2R% rises). ') +
+      'Model, Source and Lead Type filters apply' + (filtersNA ? ' — State, City and Purchased Model filters do not apply to this tab' : '') + '.');
+
+  const msgCard = (icon, title, body) => ce('div', { className: 'fade-up' }, noteBar, navCard(false),
+    ce('div', { className: 'card', style: { padding: '40px 24px', textAlign: 'center', color: '#64748B' } },
+      ce('div', { className: 'fs-32', style: { marginBottom: 10 } }, icon),
+      ce('div', { className: 'fs-14', style: { fontWeight: 700, color: '#334155', marginBottom: 6 } }, title),
+      ce('div', { className: 'fs-12', style: { maxWidth: 580, margin: '0 auto', lineHeight: 1.5 } }, body)));
+
+  const totalsLine = 'For the selected filters the month total is ' + Nf(view.tL) + ' leads and ' + Nf(view.tR) + ' retails. ';
+
+  // On Update before the pipeline has produced the retail-day table
+  if (upd && !ddu.length) return msgCard('â³', 'On Update daily detail will appear after the next pipeline run',
+    'Switch to On Create to see the day-on-day view now.');
+  // leads of this month cannot be placed on a day
+  if (view.last === 0 && view.uL > 0 && view.dR === 0) return msgCard('ðŸ—“ï¸', 'Daily detail is not available for ' + sel,
+    'The source data for this month records only the lead month, not the day each lead was created. ' + totalsLine +
+    "Apr'25 – Jan'26 and Jul'26 onwards have full daily detail.");
+  // On Update: most of this month's retails carry no attribution day (history before the live retail sheet)
+  if (upd && view.uR > view.dR) return msgCard('ðŸ—“ï¸', 'On Update daily retail detail is not available for ' + sel,
+    "The retail source only records the month for most of this month's retails, not the day. " + totalsLine +
+    'Switch to On Create for the day-on-day view of this month, or pick Apr\'26 onwards for On Update.');
+  if (view.last === 0) return msgCard('🔎', 'No leads for this selection in ' + sel, 'Try widening the Model, Source or Lead Type filters.');
+
+  const KPIs = [
+    { label: 'Leads (month to date)', value: Nf(view.tL), sub: view.last + ' day' + (view.last === 1 ? '' : 's') + ' of data', color: '#5A3E1A' },
+    { label: upd ? 'Retails (by attribution date)' : 'Retails (of leads created)', value: Nf(view.tR), sub: 'DMS ' + Nf(view.tRd) + ' · VOC ' + Nf(view.tRc), color: '#B8741A' },
+    { label: 'L2R %', value: view.l2r.toFixed(1) + '%', sub: 'Retails ÷ Leads', color: '#F5A623' },
+    { label: 'Avg leads / day', value: Nf(Math.round(view.avgL)), sub: 'over days with data', color: '#7C3AED' },
+    { label: 'Peak day', value: view.peak ? Nf(view.peak.l) : '—', sub: view.peak ? view.peak.d + ' ' + MONTHS[view.mon - 1] + ' (' + view.peak.wd + ')' : '', color: '#059669' },
+  ];
+
+  return ce('div', { className: 'fade-up' },
+    noteBar,
+    navCard(true),
+    ce('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(175px,1fr))', gap: 10, marginBottom: 20 } },
+      KPIs.map((k, i) => ce('div', { key: i, className: 'kpi' },
+        ce('div', { style: { position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: k.color, borderRadius: '12px 12px 0 0' } }),
+        ce('div', { className: 'kpi-label' }, k.label),
+        ce('div', { className: 'kpi-value' + (k.value.length > 7 ? ' kpi-long' : ''), style: { color: k.color } }, k.value),
+        ce('div', { className: 'kpi-sub', style: { color: k.color } }, k.sub)
+      ))
+    ),
+    ce('div', { className: 'card', style: { padding: '16px 18px', marginBottom: 14 } },
+      ce('div', { className: 'section-title' }, 'Day-on-Day — ' + sel + ': Leads, Retails (DMS / VOC) & L2R%' + (upd ? ' · On Update' : ' · On Create')),
+      ce('div', { style: { height: 300, position: 'relative' } }, ce('canvas', { ref: chartRef }))
+    ),
+    ce('div', { className: 'card', style: { padding: '16px 18px', marginBottom: 14 } },
+      ce('div', { className: 'section-title' }, 'Daily detail — ' + sel),
+      ce('div', { className: 'scroll-x' },
+        ce('table', null,
+          ce('thead', null, ce('tr', null,
+            ce('th', { className: 'left', style: { minWidth: 130 } }, 'Date'),
+            ce('th', null, 'Leads'),
+            ce('th', { style: { color: '#B8741A' } }, 'Retail DMS'),
+            ce('th', { style: { color: '#7C3AED' } }, 'Retail VOC'),
+            ce('th', null, 'Total Retail'),
+            ce('th', null, 'L2R%'))),
+          ce('tbody', null,
+            ...view.shown.map(x => ce('tr', { key: x.d },
+              ce('td', { className: 'label' }, x.d + ' ' + MONTHS[view.mon - 1] + ', ' + x.wd),
+              ce('td', null, Nf(x.l)),
+              ce('td', { style: { color: '#B8741A', fontWeight: 700 } }, Nf(x.rd)),
+              ce('td', { style: { color: '#7C3AED', fontWeight: 700 } }, Nf(x.rc)),
+              ce('td', { style: { fontWeight: 700 } }, Nf(x.r)),
+              ce('td', null, x.l > 0 ? Pf(x.l2r) : '—'))),
+            (view.uL > 0 || view.uR > 0) && ce('tr', { key: 'noday' },
+              ce('td', { className: 'label', style: { color: '#94A3B8' } }, 'No day recorded'),
+              ce('td', null, Nf(view.uL)),
+              ce('td', { style: { color: '#B8741A', fontWeight: 700 } }, Nf(view.nRd)),
+              ce('td', { style: { color: '#7C3AED', fontWeight: 700 } }, Nf(view.nRc)),
+              ce('td', { style: { fontWeight: 700 } }, Nf(view.uR)),
+              ce('td', null, '—')),
+            ce('tr', { className: 'total-row' },
+              ce('td', { className: 'label' }, '∑ Total'),
+              ce('td', null, Nf(view.tL)),
+              ce('td', { style: { color: '#B8741A', fontWeight: 700 } }, Nf(view.tRd)),
+              ce('td', { style: { color: '#7C3AED', fontWeight: 700 } }, Nf(view.tRc)),
+              ce('td', null, Nf(view.tR)),
+              ce('td', null, Pf(view.l2r)))
+          )
+        )
+      ),
+      (view.uL > 0 || view.uR > 0) && ce('div', { style: { marginTop: 8, fontSize: 11, color: '#94A3B8' } },
+        '"No day recorded" holds leads and retails whose source has no usable date for this month; they are included in the totals so the month ties to the Overview.')
+    )
+  );
+});
+
 const TABS = [
   { id:'overview',    label:'Overview' },
+  { id:'daily',       label:'Day on Day' },
   { id:'source',      label:'Source Analysis' },
   { id:'ltxsrc',      label:'LT × Source' },
   { id:'modelxsrc',   label:'Model × Source' },
@@ -3766,6 +3999,7 @@ function App() {
     const props = { data: effectiveData, filters, months, RT, viewerMode, leadsMode, pmMaps };
     switch (tab) {
       case 'overview':    return ce(OverviewTab,      props);
+      case 'daily':       return ce(DailyTab,         props);
       case 'source':      return ce(SourceTab,         props);
       case 'ltxsrc':      return ce(LTSourceTab,       props);
       case 'modelxsrc':   return ce(ModelSourceTab,    props);
@@ -3798,8 +4032,8 @@ function App() {
   }, 'Synced: ' + (data.t ? new Date(data.t).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—'));
 
   const userChip = ce('div', { className:'user-chip' },
-    ce('div', { className:'user-avatar' }, auth.email[0].toUpperCase()),
-    ce('span', { className:'user-name' }, auth.name || auth.email),
+    ce('div', { className:'user-avatar' }, (auth.email || 'J')[0].toUpperCase()),
+    ce('span', { className:'user-name' }, auth.name || auth.email || 'Jawa dashboard'),
     ce('span', { className:'user-role-badge ' + (viewerMode ? 'role-viewer' : 'role-full') },
       viewerMode ? 'Viewer' : 'Full'),
   );
@@ -4426,14 +4660,14 @@ const DispersionTab = React.memo(function DispersionTab({ data, filters, months,
         if (!modelAcc.has(eMdl)) modelAcc.set(eMdl, { same:0, cross:0 });
         const e = modelAcc.get(eMdl);
         for (const [pi, cnt] of piMap) {
-          if (maps.mdl[pi] === eMdl) e.same+=cnt; else e.cross+=cnt;
+          if (dlm[pi] !== 'Unknown' && dlm[pi] === mdl_disp[ei]) e.same+=cnt; else e.cross+=cnt;
         }
       }
     }
     return [...modelAcc.entries()]
       .map(([m, e]) => ({ m, same:e.same, cross:e.cross, total:e.same+e.cross, disp:e.same+e.cross>0?e.cross/(e.same+e.cross)*100:0 }))
       .sort((a,b)=>b.total-a.total);
-  }, [byMonth, maps]);
+  }, [byMonth, maps, dlm, mdl_disp]);
 
   return ce('div', { className:'fade-up' },
     ce('div', { style:{fontSize:12,color:'#64748B',marginBottom:14,padding:'8px 12px',background:'#F8FAFC',borderRadius:8,border:'1px solid #E2E8F0'} },

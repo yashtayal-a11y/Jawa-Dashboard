@@ -28,6 +28,21 @@ def normalize_city(raw):
     return s
 
 
+_MN = {m: i + 1 for i, m in enumerate(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])}
+
+
+def _ym(m):
+    mt = re.match(r"([A-Za-z]{3})'(\d{2})", m or '')
+    return (2000 + int(mt.group(2))) * 100 + _MN[mt.group(1)] if mt and mt.group(1) in _MN else 0
+
+
+def day_key(date_str, month):
+    """YYYYMMDD when the date falls inside `month`, else YYYYMM00 ("no day recorded" for that month)."""
+    ym = _ym(month); d = str(date_str or '').strip()
+    if ym and re.match(r'^\d{4}-\d{2}-\d{2}', d) and int(d[:4]) * 100 + int(d[5:7]) == ym: return ym * 100 + int(d[8:10])
+    return ym * 100
+
+
 def age_bucket(days):
     return 0 if days <= 7 else 1 if days <= 14 else 2 if days <= 30 else 3
 
@@ -64,6 +79,7 @@ def build_payload(leads, retail_map, built_iso):
     U = {k: {} for k in ['monthly', 'sm', 'ltm', 'mm', 'stm', 'zm', 'bdm', 'cm', 'csm', 'cxm', 'cxsm', 'stcm', 'univ', 'mxst',
                          'mlt', 'stlt', 'cdm', 'cdsm', 'stdm', 'mxdl', 'ltdl']}
     disp, u_disp, pmr, u_pmr, dl_sn, snf, ram = {}, {}, {}, {}, {}, {}, {}
+    dd, ddu = {}, {}
     ram_total = ram_valid = ram_neg = ram_no_rd = ram_no_cd = 0
 
     def bump(d, k, is_ret, rtype):
@@ -166,6 +182,22 @@ def build_payload(leads, retail_map, built_iso):
         ubump(U['cdm'], f"{cti}|{dli}|{li}", f"{cti}|{dli}|{uli}", is_ret, rtype)
         ubump(U['cdsm'], f"{cti}|{dli}|{si}|{li}", f"{cti}|{dli}|{si}|{uli}", is_ret, rtype)
 
+        # day-on-day: leads on their creation day; On Create retails sit on that day, On Update retails on their attribution day
+        kd = (day_key(L['cd'], lm), mi, si, tti)
+        v = dd.get(kd)
+        if v is None: v = dd[kd] = [0, 0, 0, 0]
+        v[0] += 1
+        if is_ret:
+            v[1] += 1
+            if 'DMS' in rtype.upper(): v[2] += 1
+            elif 'CALL' in rtype.upper(): v[3] += 1
+            ku = (day_key(rt.get('ad'), um), mi, si, tti)
+            w = ddu.get(ku)
+            if w is None: w = ddu[ku] = [0, 0, 0]
+            w[0] += 1
+            if 'DMS' in rtype.upper(): w[1] += 1
+            elif 'CALL' in rtype.upper(): w[2] += 1
+
         if is_ret:
             pm = (rt.get('pm') or '').strip() or 'Unknown'
             pmi = ix(mdl_idx, mdl_arr, pm)
@@ -209,6 +241,8 @@ def build_payload(leads, retail_map, built_iso):
     P['pmr'] = rows(pmr); P['u_pmr'] = rows(u_pmr)
     P['dl_sn'] = rows(dl_sn)
     P['ram'] = rows(ram)
+    P['dd'] = [[*k, *v] for k, v in dd.items()]
+    P['ddu'] = [[*k, *v] for k, v in ddu.items()]
     P['ram_meta'] = {'total': ram_total, 'valid': ram_valid, 'no_rd': ram_no_rd, 'no_cd': ram_no_cd, 'neg': ram_neg}
     P['snf'] = [[*map(int, k.split('|')), v] for k, v in snf.items()]
     return P

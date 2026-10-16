@@ -97,8 +97,9 @@ def parse_retails(rows):
         eid = s(r.get('enquiryId'))
         if not eid: continue
         model = s(r.get('purchasedModel')); model = ALIAS.get(model, model)
-        pm = norm_month(r.get('Performance Month')) or norm_month(r.get('performanceMonth'))
-        rec = {'model': model, 'pm': pm, 'src': 'DMS' if s(r.get('Call Type')).upper() == 'DMS' else 'VOC',
+        pmo = norm_month(r.get('Performance Month')) or norm_month(r.get('performanceMonth'))
+        pm = norm_month(r.get('Retail Attribution Month')) or norm_month(r.get('Retail_Attribution_Date')) or pmo
+        rec = {'model': model, 'pm': pm, 'pmo': pmo, 'ad': s(r.get('Retail_Attribution_Date'))[:10], 'src': 'DMS' if s(r.get('Call Type')).upper() == 'DMS' else 'VOC',
                'cm': norm_month(r.get('Create Month')) or norm_month(r.get('createTime')),
                'org': s(r.get('Organization')), 'att': s(r.get('Retail_Attribution_Date')), 'rd': s(r.get('Retail_Date'))[:10]}
         old = out.get(eid)
@@ -184,7 +185,7 @@ def main():
                         'date': F['dates'][r[8]], 'rm': F['retailModels'][r[9]] if r[9] >= 0 else '',
                         'pm': F['months'][r[10]] if r[10] >= 0 else '', 'rsrc': {0: 'DMS', 1: 'VOC'}.get(r[11], '') if r[6] else '',
                         'lid': 'F%d' % len(allrows), 'src': ('WhatsApp' if F['sources'][r[12]] == 'CTWA' else F['sources'][r[12]]) if len(r) > 13 else 'Unknown',
-                        'lt': F['leadtypes'][r[13]] if len(r) > 13 else 'Unknown', 'rd': ''})
+                        'lt': F['leadtypes'][r[13]] if len(r) > 13 else 'Unknown', 'rd': '', 'ad': ''})
     used = set(); nlive = 0
     for eid, rec in leads.items():
         lm, model, dealer, dname, city, state, st, mh, date, upd = rec[:10]
@@ -197,14 +198,14 @@ def main():
         cat, q = status_class(st, maps['status'])
         row = {'lm': lm, 'model': model, 'dealer': dealer, 'sc': cat, 'q': q, 'cs': st, 'mob': mob, 'date': date,
                'rm': '', 'pm': '', 'rsrc': '', 'lid': eid, 'src': derive_source(medium, ltype, camp, maps.get('source', {})),
-               'lt': ltype, 'rd': '', 'dname': dname, 'city': city, 'state': state}
+               'lt': ltype, 'rd': '', 'ad': '', 'dname': dname, 'city': city, 'state': state}
         rt = retails.get(eid)
         if rt:
             used.add(eid)
-            row.update(rm=rt['model'] or model, pm=rt['pm'], rsrc=rt['src'], rd=rt['rd'])
+            row.update(rm=rt['model'] or model, pm=rt['pm'], rsrc=rt['src'], rd=rt['rd'], ad=rt['ad'])
         allrows.append(row); nlive += 1
     # retails whose lead is not in Drive: new-month ones become retail-only rows, older ones belong to frozen leads
-    orphan_new = orphan_frozen = 0
+    orphan_new = orphan_frozen = 0; fro_rets = []
     name2code = {m[0].strip().lower(): k for k, m in fmeta.items()}
     for eid, rt in retails.items():
         if eid in used: continue
@@ -214,10 +215,29 @@ def main():
             allrows.append({'lm': rt['cm'], 'model': rt['model'] or 'Unspecified', 'dealer': code, 'sc': 'Converted',
                             'q': 'Qualified', 'cs': 'Retail Attribution', 'mob': next_idx, 'date': 'Unknown',
                             'rm': rt['model'], 'pm': rt['pm'], 'rsrc': rt['src'], 'lid': eid, 'src': 'Unknown', 'lt': 'Unknown',
-                            'rd': rt['rd']})
+                            'rd': rt['rd'], 'ad': rt['ad']})
             next_idx += 1; orphan_new += 1
         else:
-            orphan_frozen += 1
+            orphan_frozen += 1; fro_rets.append(rt)
+
+    # Leads up to Apr'26 are frozen without enquiry ids, so their retails are re-bucketed on the attribution month by
+    # matching each sheet retail to a frozen retailed lead (lead month + performance month + purchased model + dealer).
+    cand = defaultdict(list)
+    for x in allrows:
+        if x['lid'].startswith('F') and x['rm'] and x['pm'] and mkey(x['pm']) >= mkey("Apr'26"):
+            dn = (fmeta.get(x['dealer']) or [''])[0].strip().lower()
+            for k in ((x['lm'], x['pm'], x['rm'], dn), (x['lm'], x['pm'], x['rm']), (x['lm'], x['pm'])):
+                cand[k].append(x)
+    taken, done, mstats = set(), set(), Counter()
+    for tier in (4, 3, 2):
+        for rt in fro_rets:
+            if id(rt) in done: continue
+            k = (rt['cm'], rt['pmo'], rt['model'], rt['org'].strip().lower())[:tier]
+            for x in cand.get(k, ()):
+                if id(x) in taken: continue
+                taken.add(id(x)); done.add(id(rt)); x['pm'] = rt['pm']; x['ad'] = rt['ad']; x['rd'] = rt['rd']
+                mstats[tier] += 1; break
+    log(f"frozen-lead retails re-bucketed on attribution month: {len(done)} of {len(fro_rets)} sheet rows (by match tier {dict(mstats)})")
     log(f"live leads {nlive:,}; retail-only rows {orphan_new}; retails on frozen months (already in frozen data, not re-added) {orphan_frozen}")
 
     # ---- 5. encode
@@ -254,7 +274,7 @@ def main():
         p_leads.append({'lid': x['lid'], 'lm': x['lm'], 'src': x['src'], 'lt': x['lt'], 'mdl': x['model'], 'st': stt, 'city': ci,
                         'cd': x['date'], 'dl': dn, 'sn': x['cs']})
         if x['rm']:
-            p_ret[x['lid']] = {'rtype': 'DMS' if x['rsrc'] == 'DMS' else 'Call Out', 'rm': x['pm'], 'pm': x['rm'], 'rd': x.get('rd', '')}
+            p_ret[x['lid']] = {'rtype': 'DMS' if x['rsrc'] == 'DMS' else 'Call Out', 'rm': x['pm'], 'pm': x['rm'], 'rd': x.get('rd', ''), 'ad': x.get('ad', '')}
     built_iso = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=5, minutes=30)).isoformat()
     payload = build_payload(p_leads, p_ret, built_iso)
     # Unique-leads version: one enquiry per customer (mobile): the retailing enquiry if there is one, else the earliest.
