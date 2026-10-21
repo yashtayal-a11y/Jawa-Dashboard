@@ -47,6 +47,6 @@
     if (!r.ok) return;
     bar.dataset.ok = '1'; sync();
     var want = null; try { want = sessionStorage.getItem(KEY); } catch (e) {}
-    show(want === 'new' ? 'new' : 'old');
+    show(want === 'old' ? 'old' : 'new');   // New is the default; a visitor's own pick is kept for the session
   }).catch(function () {});
 })();
