@@ -82,14 +82,18 @@ jobs:
           gh release upload jawa-state work/live.enc --clobber
 
       - name: Keep repo active
+        continue-on-error: true      # a keep-alive commit must never block publishing
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Last run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > last_run.txt
-          git add last_run.txt
-          git diff --cached --quiet || git commit -m "chore: refresh $(date -u '+%Y-%m-%d %H:%M')"
-          git pull --rebase
-          git push
+          for i in 1 2 3; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            echo "Last run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > last_run.txt
+            git add last_run.txt
+            git diff --cached --quiet || git commit -q -m "chore: refresh $(date -u '+%Y-%m-%d %H:%M')"
+            git push && break
+            sleep 3
+          done
 
       - name: Publish to Cloudflare Pages
         if: steps.mode.outputs.cf == 'true'
