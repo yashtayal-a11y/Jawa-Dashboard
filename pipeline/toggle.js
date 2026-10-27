@@ -17,7 +17,9 @@
   var bNew = document.createElement('button'); bNew.textContent = 'New';
   bar.appendChild(lab); bar.appendChild(bOld); bar.appendChild(bNew); document.body.appendChild(bar);
 
+  var cur = 'old';
   function show(which) {
+    cur = which;
     try { sessionStorage.setItem(KEY, which); } catch (e) {}
     bOld.className = which === 'old' ? 'on' : ''; bNew.className = which === 'new' ? 'on' : '';
     if (which === 'new') {
@@ -39,7 +41,10 @@
   function sync() {   // stay hidden behind the sign-in screen
     var locked = document.body.classList.contains('jw-locked');
     if (bar.dataset.ok === '1') bar.style.display = locked ? 'none' : 'flex';
-    if (frame && locked) frame.style.display = 'none';
+    if (frame) {                       // hidden behind the sign-in screen, shown again once signed in if New is selected
+      var want = (!locked && cur === 'new') ? 'block' : 'none';
+      if (frame.style.display !== want) { frame.style.display = want; document.body.style.overflow = want === 'block' ? 'hidden' : ''; }
+    }
   }
   setInterval(sync, 700);
 
