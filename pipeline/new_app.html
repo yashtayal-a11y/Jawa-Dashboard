@@ -4720,6 +4720,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
   const [metrics,    setMetrics]    = useState(['leads']);
   const [sortBy,     setSortBy]     = useState('__total__');
   const [sortDir,    setSortDir]    = useState('desc');
+  const [sortM,      setSortM]      = useState(null);   // value (Leads / Retails / Retail %...) the sort uses; null = first selected
   const [topN,       setTopN]       = useState(20);
   const [collapsed,  setCollapsed]  = useState(new Set());
   const [addRowOpen, setAddRowOpen] = useState(false);
@@ -4925,6 +4926,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
   }, [rawMatrix, matConfig, rowDims, colDims, filterSets, maps, pmInfo]);
 
   const pm = metrics[0] || 'leads'; // primary metric drives column ordering + sorting
+  const sm = (sortM && metrics.includes(sortM)) ? sortM : pm;   // metric the row sort uses
 
   const orderedCols = useMemo(() => {
     if (!pivotResult) return [];
@@ -5000,20 +5002,41 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     if (!pivotResult) return [];
     const rows = [];
     for (const [label, entry] of pivotResult.tbl) {
-      const total = rowTotal(entry.sub, pm);
+      const total = rowTotal(entry.sub, sm);
       rows.push({ label, entry, total });
     }
     rows.sort((a, b) => {
       let av, bv;
       if (sortBy === '__total__') { av = a.total; bv = b.total; }
       else if (sortBy === '__label__') { av = a.label; bv = b.label; }
-      else { av = getMetricVal(a.entry.sub.get(sortBy), pm); bv = getMetricVal(b.entry.sub.get(sortBy), pm); }
+      else { av = getMetricVal(a.entry.sub.get(sortBy), sm); bv = getMetricVal(b.entry.sub.get(sortBy), sm); }
       if (av === bv) return 0;
       if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
       return sortDir === 'asc' ? av - bv : bv - av;
     });
     return topN > 0 ? rows.slice(0, topN) : rows;
-  }, [pivotResult, pm, sortBy, sortDir, topN]);
+  }, [pivotResult, pm, sm, sortBy, sortDir, topN]);
+
+  // child rows (e.g. the states under a model) use the same sort as the groups
+  const sortChildren = (children) => {
+    const arr = [...children.entries()];
+    arr.sort((a, b) => {
+      let av, bv;
+      if (sortBy === '__label__') { av = a[0]; bv = b[0]; }
+      else if (sortBy === '__total__') { av = rowTotal(a[1], sm); bv = rowTotal(b[1], sm); }
+      else { av = getMetricVal(a[1].get(sortBy), sm); bv = getMetricVal(b[1].get(sortBy), sm); }
+      if (av === bv) return 0;
+      if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      return sortDir === 'asc' ? av - bv : bv - av;
+    });
+    return arr;
+  };
+  // click a column header: sort by it (and its value); click again to flip Asc / Desc
+  const clickSort = (key, m) => {
+    if (sortBy === key && sm === m) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortBy(key); setSortM(m); setSortDir('desc'); }
+  };
+  const sortArrow = (key, m) => (sortBy === key && sm === m) ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
 
   const grandTotals = useMemo(() => {
     if (!pivotResult) return { colVals: {}, gl: 0, gr: 0 };
@@ -5258,9 +5281,11 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
 
       ce('div', null,
         ce('div', { style:{fontSize:10,fontWeight:700,color:'#64748B',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6} }, 'Order'),
-        ce('select', { value:sortDir, onChange:e=>setSortDir(e.target.value), style:selSt },
-          ce('option',{value:'desc'},'↓  High → Low'),
-          ce('option',{value:'asc' },'↑  Low → High'),
+        ce('div', { style:{ display:'flex', gap:4 } },
+          ['asc','desc'].map(d => ce('button', { key:d, onClick:()=>setSortDir(d), title: d==='asc' ? 'Ascending (low to high)' : 'Descending (high to low)',
+            style:{ ...selSt, cursor:'pointer', fontWeight:700, padding:'6px 12px',
+                    background: sortDir===d ? '#B8741A' : '#fff', color: sortDir===d ? '#fff' : '#475569',
+                    border: '1px solid ' + (sortDir===d ? '#B8741A' : '#CBD5E1') } }, d==='asc' ? '▲ Asc' : '▼ Desc'))
         )
       ),
 
@@ -5449,11 +5474,13 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
               if (multiMetric) {
                 return metrics.map((m, mi) =>
                   ce('th', { key:`bot_${ck}_${m}`,
+                    title: 'Click to sort (click again to flip Asc / Desc)',
                     style:{ padding:'6px 10px', textAlign:'right', fontWeight:500, whiteSpace:'nowrap',
-                            fontSize:11, color:botTxt, background:botBg,
+                            fontSize:11, color:botTxt, background:botBg, cursor:'pointer', userSelect:'none',
                             borderLeft: mi===0&&groupBorder ? '1px solid rgba(255,255,255,0.15)'
-                                       : mi===0&&ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none' }
-                  }, METRICS.find(x=>x.key===m)?.label||m)
+                                       : mi===0&&ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none' },
+                    onClick: () => clickSort(ck, m)
+                  }, (METRICS.find(x=>x.key===m)?.label||m) + sortArrow(ck, m))
                 );
               }
               // single metric
@@ -5467,9 +5494,10 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                         color:botTxt, background:botBg,
                         borderLeft: groupBorder ? '1px solid rgba(255,255,255,0.15)'
                                    : ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none',
-                        cursor: sortable ? 'pointer' : 'default', userSelect:'none' },
-                onClick: sortable ? ()=>{ setSortBy(ck); setSortDir(d=>d==='asc'?'desc':'asc'); } : undefined
-              }, colLabel + (sortable&&sortBy===ck?(sortDir==='asc'?' ↑':' ↓'):''))];
+                        cursor: 'pointer', userSelect:'none' },
+                title: 'Click to sort (click again to flip Asc / Desc)',
+                onClick: ()=>clickSort(ck, metrics[0])
+              }, colLabel + sortArrow(ck, metrics[0]))];
             }),
 
             // TOTAL header(s)
@@ -5480,10 +5508,10 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                         fontWeight:700, whiteSpace:'nowrap',
                         fontSize: multiMetric?11:13, color:botTxt, background:botBg,
                         borderLeft: mi===0 ? '2px solid rgba(255,255,255,0.3)' : 'none',
-                        cursor: sortable ? 'pointer' : 'default', userSelect:'none' },
-                onClick: sortable ? ()=>{ setSortBy('__total__'); setSortDir(d=>d==='asc'?'desc':'asc'); } : undefined
-              }, multiMetric ? (METRICS.find(x=>x.key===m)?.label||m)
-                             : ('TOTAL'+(sortBy==='__total__'?(sortDir==='asc'?' ↑':' ↓'):'')));
+                        cursor: 'pointer', userSelect:'none' },
+                title: 'Click to sort by total (click again to flip Asc / Desc)',
+                onClick: ()=>clickSort('__total__', m)
+              }, (multiMetric ? (METRICS.find(x=>x.key===m)?.label||m) : 'TOTAL') + sortArrow('__total__', m));
             })
           ));
 
@@ -5558,7 +5586,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
             // Child rows (secondary dim, only when expanded)
             if (hasR2 && !isCollapsed) {
               let ci = 0;
-              for (const [r2Label, cMap] of entry.children) {
+              for (const [r2Label, cMap] of sortChildren(entry.children)) {
                 const cBg  = ci++%2===0 ? pal.cEven : pal.cOdd;
                 const cTxt = pal.txt;
                 rows.push(ce('tr', { key:`c_${label}_${r2Label}`, style:{ background:cBg } },
