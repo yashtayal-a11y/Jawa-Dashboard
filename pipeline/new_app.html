@@ -1603,6 +1603,7 @@ const ModelSourceTab = React.memo(function ModelSourceTab({ data, filters, month
     const allMdl = !filters.models || filters.models.size === 0;
     const univF  = makeUnivFilter(filters);
     const pmRI   = RT === 'dms' ? 1 : RT === 'co' ? 2 : 0;
+    const pmActive = !!(filters.purchasedModels && filters.purchasedModels.size > 0);
 
     if (univF) {
       // univ path: mi=row[0], si=row[1], li=row[4]
@@ -1624,7 +1625,7 @@ const ModelSourceTab = React.memo(function ModelSourceTab({ data, filters, month
         (row,maps) => { const mdl=maps.mdl[row[0]]; return allMdl||filters.models.has(mdl) ? mdl : null; },
         (row,maps) => maps.src[row[1]],
         (row,maps) => maps.lm[row[4]],
-        univF, eff
+        univF, pmActive ? eff : getLR
       );
     }
 
@@ -1643,7 +1644,7 @@ const ModelSourceTab = React.memo(function ModelSourceTab({ data, filters, month
       (row,maps) => { const mdl=maps.mdl[row[0]]; return allMdl||filters.models.has(mdl) ? mdl : null; },
       (row,maps) => maps.src[row[1]],
       (row,maps) => maps.lm[row[2]],
-      null, eff
+      null, pmActive ? eff : getLR
     );
   }, [mm, univ, maps, filters, getLR, pmiSiLi, RT]);
 
