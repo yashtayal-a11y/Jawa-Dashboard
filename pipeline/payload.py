@@ -75,11 +75,11 @@ def build_payload(leads, retail_map, built_iso):
         return d[v]
 
     M = {k: {} for k in ['monthly', 'sm', 'ltm', 'mm', 'stm', 'zm', 'bdm', 'cm', 'csm', 'cxm', 'cxsm', 'stcm', 'univ', 'mxst',
-                         'mlt', 'stlt', 'cdm', 'cdsm', 'stdm', 'mxdl', 'ltdl']}
+                         'mlt', 'stlt', 'cdm', 'cdsm', 'stdm', 'mxdl', 'ltdl', 'cslt']}
     U = {k: {} for k in ['monthly', 'sm', 'ltm', 'mm', 'stm', 'zm', 'bdm', 'cm', 'csm', 'cxm', 'cxsm', 'stcm', 'univ', 'mxst',
-                         'mlt', 'stlt', 'cdm', 'cdsm', 'stdm', 'mxdl', 'ltdl']}
+                         'mlt', 'stlt', 'cdm', 'cdsm', 'stdm', 'mxdl', 'ltdl', 'cslt']}
     disp, u_disp, pmr, u_pmr, dl_sn, snf, ram = {}, {}, {}, {}, {}, {}, {}
-    dd, ddu = {}, {}
+    dd, ddu, ddp, ddup, pmx = {}, {}, {}, {}, {}
     ram_total = ram_valid = ram_neg = ram_no_rd = ram_no_cd = 0
 
     def bump(d, k, is_ret, rtype):
@@ -134,6 +134,7 @@ def build_payload(leads, retail_map, built_iso):
         bump(M['csm'], f"{cti}|{si}|{li}", is_ret, rtype)
         bump(M['cxm'], f"{cti}|{mi}|{li}", is_ret, rtype)
         bump(M['cxsm'], f"{cti}|{si}|{mi}|{li}", is_ret, rtype)
+        bump(M['cslt'], f"{cti}|{si}|{tti}|{li}", is_ret, rtype)
         bump(M['stcm'], f"{sti}|{cti}|{li}", is_ret, rtype)
         bump(M['univ'], f"{mi}|{si}|{sti}|{tti}|{li}", is_ret, rtype)
 
@@ -176,6 +177,7 @@ def build_payload(leads, retail_map, built_iso):
         ubump(U['csm'], f"{cti}|{si}|{li}", f"{cti}|{si}|{uli}", is_ret, rtype)
         ubump(U['cxm'], f"{cti}|{mi}|{li}", f"{cti}|{mi}|{uli}", is_ret, rtype)
         ubump(U['cxsm'], f"{cti}|{si}|{mi}|{li}", f"{cti}|{si}|{mi}|{uli}", is_ret, rtype)
+        ubump(U['cslt'], f"{cti}|{si}|{tti}|{li}", f"{cti}|{si}|{tti}|{uli}", is_ret, rtype)
         ubump(U['stdm'], f"{sti}|{dli}|{li}", f"{sti}|{dli}|{uli}", is_ret, rtype)
         ubump(U['mxdl'], f"{mi}|{dli}|{li}", f"{mi}|{dli}|{uli}", is_ret, rtype)
         ubump(U['ltdl'], f"{tti}|{dli}|{li}", f"{tti}|{dli}|{uli}", is_ret, rtype)
@@ -183,7 +185,7 @@ def build_payload(leads, retail_map, built_iso):
         ubump(U['cdsm'], f"{cti}|{dli}|{si}|{li}", f"{cti}|{dli}|{si}|{uli}", is_ret, rtype)
 
         # day-on-day: leads on their creation day; On Create retails sit on that day, On Update retails on their attribution day
-        kd = (day_key(L['cd'], lm), mi, si, tti)
+        kd = (day_key(L['cd'], lm), mi, si, tti, sti)
         v = dd.get(kd)
         if v is None: v = dd[kd] = [0, 0, 0, 0]
         v[0] += 1
@@ -191,7 +193,7 @@ def build_payload(leads, retail_map, built_iso):
             v[1] += 1
             if 'DMS' in rtype.upper(): v[2] += 1
             elif 'CALL' in rtype.upper(): v[3] += 1
-            ku = (day_key(rt.get('ad'), um), mi, si, tti)
+            ku = (day_key(rt.get('ad'), um), mi, si, tti, sti)
             w = ddu.get(ku)
             if w is None: w = ddu[ku] = [0, 0, 0]
             w[0] += 1
@@ -205,6 +207,19 @@ def build_payload(leads, retail_map, built_iso):
             disp[f"{mi}|{dmi}|{li}"] = disp.get(f"{mi}|{dmi}|{li}", 0) + 1
             u_disp[f"{mi}|{dmi}|{uli}"] = u_disp.get(f"{mi}|{dmi}|{uli}", 0) + 1
             ru = rtype.upper()
+            # purchased model by day (On Create: lead's creation day, On Update: attribution day) and with every filter
+            for d, kk in ((ddp, (kd[0], mi, si, tti, sti, pmi)), (ddup, (ku[0], mi, si, tti, sti, pmi))):
+                v = d.get(kk)
+                if v is None: v = d[kk] = [0, 0, 0]
+                v[0] += 1
+                if 'DMS' in ru: v[1] += 1
+                elif 'CALL' in ru: v[2] += 1
+            kx = (pmi, mi, si, sti, tti, cti, dli, li, uli)
+            v = pmx.get(kx)
+            if v is None: v = pmx[kx] = [0, 0, 0]
+            v[0] += 1
+            if 'DMS' in ru: v[1] += 1
+            elif 'CALL' in ru: v[2] += 1
             for d, k in ((pmr, f"{pmi}|{mi}|{si}|{li}"), (u_pmr, f"{pmi}|{mi}|{si}|{uli}")):
                 v = d.get(k)
                 if v is None: v = d[k] = [0, 0, 0]
@@ -243,6 +258,11 @@ def build_payload(leads, retail_map, built_iso):
     P['ram'] = rows(ram)
     P['dd'] = [[*k, *v] for k, v in dd.items()]
     P['ddu'] = [[*k, *v] for k, v in ddu.items()]
+    P['dd_v'] = 2                    # day rows carry the state after lead type
+    P['ddp'] = [[*k, *v] for k, v in ddp.items()]
+    P['ddup'] = [[*k, *v] for k, v in ddup.items()]
+    P['pmx'] = [[*k, *v] for k, v in pmx.items()]
+    P['pmx_v'] = 2                   # [pmi, mi, si, sti, tti, cti, dli, create-month, retail-month, R, Rd, Rc]
     P['ram_meta'] = {'total': ram_total, 'valid': ram_valid, 'no_rd': ram_no_rd, 'no_cd': ram_no_cd, 'neg': ram_neg}
     P['snf'] = [[*map(int, k.split('|')), v] for k, v in snf.items()]
     return P

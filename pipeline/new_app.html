@@ -299,6 +299,36 @@ function classifySrc(s) {
   if (['organic'].some(p => n.includes(p))) return 'organic';
   return 'nonms';
 }
+// Saved Pivot templates live in the access service (per user), so they follow the user to any browser.
+async function _tplCall(fn) {
+  let lastErr;
+  for (let a = 0; a < 3; a++) {
+    if (a > 0) await new Promise(res => setTimeout(res, 800 * a));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    try {
+      const j = await fn(ctrl.signal);
+      if (j && j.error) { const e = new Error(j.error); e.final = true; throw e; }   // server said no: do not retry
+      return j;
+    } catch (e) { lastErr = e; if (e.final) break; }
+    finally { clearTimeout(timer); }
+  }
+  throw lastErr;
+}
+async function apiGetTemplates(email) {
+  const j = await _tplCall(async sig => _safeJson(await fetch(APPS_SCRIPT_URL + '?action=getTemplates&email=' + encodeURIComponent(email), { signal: sig }), 'getTemplates'));
+  return j.templates || [];
+}
+async function apiSaveTemplate(email, template) {
+  const j = await _tplCall(async sig => _safeJson(await fetch(APPS_SCRIPT_URL + '?action=saveTemplate', {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ email, template }), signal: sig }), 'saveTemplate'));
+  return j.templates || [];
+}
+async function apiDeleteTemplate(email, name) {
+  const j = await _tplCall(async sig => _safeJson(await fetch(APPS_SCRIPT_URL + '?action=deleteTemplate', {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ email, name }), signal: sig }), 'deleteTemplate'));
+  return j.templates || [];
+}
 function buildSrcGroups(srcList) {
   const adw = srcList.filter(s => classifySrc(s) === 'adwords');
   const fb  = srcList.filter(s => classifySrc(s) === 'msfb');
@@ -3603,11 +3633,53 @@ const ModelPerfTab = React.memo(function ModelPerfTab({ data, filters, months, R
    day = YYYYMMDD ; YYYYMM00 = "no day recorded" for that month (kept so month totals always reconcile).
    State / City / Purchased-model filters do not exist in these tables.
    â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+let _dailyPromise = null;
+function loadDailyDetail() {
+  if (!_dailyPromise) {
+    _dailyPromise = fetch('./data/jawa_daily.json.gz', { cache: 'no-store' }).then(async resp => {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.pipeThrough(new DecompressionStream('gzip')).getReader();
+      const chunks = [];
+      while (true) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+      return JSON.parse(await new Blob(chunks).text());
+    }).catch(() => { _dailyPromise = null; return null; });
+  }
+  return _dailyPromise;
+}
+
+// "▲ 12.3%" / "▼ 4.0 pp" for the month-to-date comparison (null when it cannot be computed).
+// Per-index filter masks for the daily detail file (every filter; Purchased Model is returned separately, it only affects retails).
+function dailyPreds(dx, filters, maps) {
+  const has = s => !!(s && s.size);
+  let pmSel = null;
+  if (has(filters.purchasedModels)) {
+    const selNames = new Set([...resolvePmIdx(filters.purchasedModels, maps)].map(i => maps.mdl[i]));
+    pmSel = new Set();
+    dx.maps.mdl.forEach((name, i) => { if (selNames.has(name)) pmSel.add(i); });
+  }
+  return {
+    pmSel,
+    okM:  dx.maps.mdl.map(n => !has(filters.models) || filters.models.has(n)),
+    okS:  dx.maps.src.map(n => !has(filters.sources) || filters.sources.has(n)),
+    okT:  dx.maps.lt.map(n => !has(filters.leadTypes) || filters.leadTypes.has(n)),
+    okSt: dx.maps.st.map(n => !has(filters.states) || filters.states.has(n)),
+    okC:  dx.cityName.map(n => !has(filters.cities) || filters.cities.has(n)),
+  };
+}
+
+function fmtDelta(v, unit) {
+  if (v == null || !isFinite(v)) return null;
+  const a = Math.abs(v).toFixed(1);
+  return { up: v >= 0, txt: (v >= 0 ? '▲ +' : '▼ −') + a + unit };
+}
+
 const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leadsMode }) {
   const { maps } = data;
   const dd  = data.dd  || [];
   const ddu = data.ddu || [];
   const upd = leadsMode === 'update';
+  const hasSt = data.dd_v === 2;          // rows carry a state column after lead type (older payloads do not)
+  const o = hasSt ? 1 : 0;
   const chartRef = useRef(); const chartInst = useRef();
   const WD = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
@@ -3617,39 +3689,85 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
   useEffect(() => { if (opts.length && !opts.includes(sel)) setSel(opts[0]); }, [opts]);
   const idx = opts.indexOf(sel);
 
+  // Full-granularity daily detail (city / purchased model) for the latest 4 months, loaded on demand (admin tab only).
+  const [daily, setDaily] = useState(null);
+  useEffect(() => {
+    let live = true;
+    loadDailyDetail().then(d => { if (live) setDaily(d && d.t === data.t ? d : false); });
+    return () => { live = false; };
+  }, [data.t]);
+  const dx = useMemo(() => (daily ? { ...daily, cityName: daily.maps.city.map(c => canonicalCity(c)) } : null), [daily]);
+
   const view = useMemo(() => {
     const mt = (sel || '').match(/([A-Za-z]+)'(\d+)/);
-    if (!mt || !dd.length) return null;
+    if (!mt) return null;
     const year = 2000 + parseInt(mt[2], 10), mon = MONTHS.indexOf(mt[1]) + 1;
     if (mon < 1) return null;
     const ym = year * 100 + mon, dim = new Date(year, mon, 0).getDate();
-    const allMdl = !filters.models    || filters.models.size    === 0;
-    const allSrc = !filters.sources   || filters.sources.size   === 0;
-    const allLT  = !filters.leadTypes || filters.leadTypes.size === 0;
-    const keep = row => Math.floor(row[0] / 100) === ym
-      && (allMdl || filters.models.has(maps.mdl[row[1]]))
-      && (allSrc || filters.sources.has(maps.src[row[2]]))
-      && (allLT  || filters.leadTypes.has(maps.lt[row[3]]));
-    const L = new Array(dim).fill(0), Rd = new Array(dim).fill(0), Rc = new Array(dim).fill(0);
-    let uL = 0, uRd = 0, uRc = 0;                       // "no day recorded" parts of the month
-    for (const row of dd) {
-      if (!keep(row)) continue;
-      const d = row[0] % 100;
-      if (d === 0 || d > dim) { uL += row[4]; if (!upd) { uRd += row[6]; uRc += row[7]; } continue; }
-      L[d - 1] += row[4];
-      if (!upd) { Rd[d - 1] += row[6]; Rc[d - 1] += row[7]; }
-    }
-    if (upd) {
-      for (const row of ddu) {
+    const pYear = mon === 1 ? year - 1 : year, pMon = mon === 1 ? 12 : mon - 1;
+    const pYm = pYear * 100 + pMon, pDim = new Date(pYear, pMon, 0).getDate();
+    const allMdl  = !filters.models    || filters.models.size    === 0;
+    const allSrc  = !filters.sources   || filters.sources.size   === 0;
+    const allLT   = !filters.leadTypes || filters.leadTypes.size === 0;
+    const allSt   = !filters.states    || filters.states.size    === 0;
+    const allCity = !filters.cities    || filters.cities.size    === 0;
+    const needExact = !allCity || !!(filters.purchasedModels && filters.purchasedModels.size);
+
+    const P = dx ? dailyPreds(dx, filters, maps) : null;
+    const { okM, okS, okT, okSt, okC, pmSel } = P || {};
+
+    // One month of per-day leads / retails under the current filters.
+    const calc = (cym, cdim) => {
+      const L = new Array(cdim).fill(0), Rd = new Array(cdim).fill(0), Rc = new Array(cdim).fill(0);
+      let uL = 0, uRd = 0, uRc = 0;                       // "no day recorded" parts of the month
+      if (dx && dx.months.includes(cym)) {
+        const A = dx.L, B = dx.R, K = upd ? B.ud : B.cd;
+        for (let i = 0; i < A.n.length; i++) {          // leads: every filter except Purchased Model
+          if (Math.floor(A.d[i] / 100) !== cym) continue;
+          if (!(okM[A.mi[i]] && okS[A.si[i]] && okT[A.lt[i]] && okSt[A.st[i]] && okC[A.ci[i]])) continue;
+          const d = A.d[i] % 100;
+          if (d === 0 || d > cdim) uL += A.n[i]; else L[d - 1] += A.n[i];
+        }
+        for (let i = 0; i < B.n.length; i++) {
+          if (Math.floor(K[i] / 100) !== cym || B.rt[i] === 2) continue;
+          if (!((pmSel || okM[B.mi[i]]) && okS[B.si[i]] && okT[B.lt[i]] && okSt[B.st[i]] && okC[B.ci[i]])) continue;   // a Purchased Model selection replaces the enquired-Model filter for retails
+          if (pmSel && !pmSel.has(B.pm[i])) continue;
+          const d = K[i] % 100, dms = B.rt[i] === 0;
+          if (d === 0 || d > cdim) { if (dms) uRd += B.n[i]; else uRc += B.n[i]; }
+          else if (dms) Rd[d - 1] += B.n[i]; else Rc[d - 1] += B.n[i];
+        }
+        return { L, Rd, Rc, uL, uRd, uRc, exact: true };
+      }
+      if (!dd.length) return null;
+      const keep = row => Math.floor(row[0] / 100) === cym
+        && (allMdl || filters.models.has(maps.mdl[row[1]]))
+        && (allSrc || filters.sources.has(maps.src[row[2]]))
+        && (allLT  || filters.leadTypes.has(maps.lt[row[3]]))
+        && (!hasSt || allSt || filters.states.has(maps.st[row[4]]));
+      for (const row of dd) {
         if (!keep(row)) continue;
         const d = row[0] % 100;
-        if (d === 0 || d > dim) { uRd += row[5]; uRc += row[6]; continue; }
-        Rd[d - 1] += row[5]; Rc[d - 1] += row[6];
+        if (d === 0 || d > cdim) { uL += row[4 + o]; if (!upd) { uRd += row[6 + o]; uRc += row[7 + o]; } continue; }
+        L[d - 1] += row[4 + o];
+        if (!upd) { Rd[d - 1] += row[6 + o]; Rc[d - 1] += row[7 + o]; }
       }
-    }
+      if (upd) {
+        for (const row of ddu) {
+          if (!keep(row)) continue;
+          const d = row[0] % 100;
+          if (d === 0 || d > cdim) { uRd += row[5 + o]; uRc += row[6 + o]; continue; }
+          Rd[d - 1] += row[5 + o]; Rc[d - 1] += row[6 + o];
+        }
+      }
+      return { L, Rd, Rc, uL, uRd, uRc, exact: false };
+    };
+
+    const cur = calc(ym, dim);
+    if (!cur) return null;
+    const { L, Rd, Rc, uL, uRd, uRc } = cur;
     const showD = RT !== 'co', showC = RT !== 'dms';
-    let last = 0;
-    for (let i = 0; i < dim; i++) if (L[i] > 0 || Rd[i] > 0 || Rc[i] > 0) last = i + 1;
+    let last = 0, lastL = 0;                       // lastL: latest day that has leads (a day with only retails is not a full lead day)
+    for (let i = 0; i < dim; i++) { if (L[i] > 0 || Rd[i] > 0 || Rc[i] > 0) last = i + 1; if (L[i] > 0) lastL = i + 1; }
     const days = [];
     for (let i = 0; i < dim; i++) {
       const rd = showD ? Rd[i] : 0, rc = showC ? Rc[i] : 0;
@@ -3662,9 +3780,33 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
     const nRd = showD ? uRd : 0, nRc = showC ? uRc : 0, uR = nRd + nRc;     // no-day retails
     const tL = dL + uL, tRd = dRd + nRd, tRc = dRc + nRc, tR = tRd + tRc;   // month totals incl. no-day
     const peak = shown.reduce((b, x) => (x.l > b.l ? x : b), shown[0]);
+
+    // Month-to-date comparison: days 1..cut of this month against days 1..cut of the previous month,
+    // where cut = the latest day that has leads (so a part-day of retails does not skew it).
+    let cmp = null;
+    const prev = calc(pYm, pDim);
+    if (prev && (prev.exact || !needExact) && prev.L.some(v => v > 0)) {
+      let cut = 0;
+      for (let i = 0; i < dim; i++) if (L[i] > 0) cut = i + 1;
+      if (cut > 0) {
+        const win = (A, n) => { let s = 0; for (let i = 0; i < Math.min(n, A.length); i++) s += A[i]; return s; };
+        const pcut = Math.min(cut, pDim);
+        const cL = win(L, cut), pL = win(prev.L, pcut);
+        const cR = (showD ? win(Rd, cut) : 0) + (showC ? win(Rc, cut) : 0);
+        const pR = (showD ? win(prev.Rd, pcut) : 0) + (showC ? win(prev.Rc, pcut) : 0);
+        const cPk = Math.max(...L.slice(0, cut)), pPk = Math.max(...prev.L.slice(0, pcut));
+        const pct = (a, b) => (b > 0 ? (a - b) / b * 100 : null);
+        cmp = {
+          label: '1–' + cut + ' ' + MONTHS[pMon - 1],
+          leads: pct(cL, pL), retails: pct(cR, pR),
+          l2r: (cL > 0 && pL > 0) ? (cR / cL - pR / pL) * 100 : null,
+          avg: pct(cL / cut, pL / pcut), peak: pct(cPk, pPk),
+        };
+      }
+    }
     return { year, mon, dim, days, shown, last, uL, uR, nRd, nRc, dL, dR: dRd + dRc, tL, tR, tRd, tRc, peak,
-             avgL: last ? dL / last : 0, l2r: tL > 0 ? tR / tL * 100 : 0 };
-  }, [dd, ddu, sel, filters, RT, maps, upd]);
+             avgL: lastL ? dL / lastL : 0, l2r: tL > 0 ? tR / tL * 100 : 0, exact: cur.exact, cmp };
+  }, [dd, ddu, sel, filters, RT, maps, upd, hasSt, dx]);
 
   useEffect(() => {
     const canvas = chartRef.current;
@@ -3710,14 +3852,76 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
   if (!opts.length || !view) return ce('div', { className: 'fs-14', style: { textAlign: 'center', padding: 60, color: '#94A3B8' } },
     'No month selected — pick at least one month in the Month filter above.');
 
-  const filtersNA = [(filters.states && filters.states.size), (filters.cities && filters.cities.size), (filters.purchasedModels && filters.purchasedModels.size)].some(n => n > 0);
+  const filtersNA = !view.exact && [(!hasSt && filters.states && filters.states.size), (filters.cities && filters.cities.size), (filters.purchasedModels && filters.purchasedModels.size)].some(n => n > 0);
 
+  const noDayLabel = upd ? 'Attributed outside month (month-close)' : 'No day recorded';
   const exportData = () => {
+    const showD = RT !== 'co', showC = RT !== 'dms';
+    const dayTxt = d => (d % 100 === 0 ? noDayLabel : (d % 100) + ' ' + MONTHS[Math.floor(d / 100) % 100 - 1] + ' ' + Math.floor(d / 10000));
+    const pct = (l, rr) => (l > 0 ? +(rr / l * 100).toFixed(2) : '');
     const aoa = [['Date', 'Day', 'Leads (created)', 'Retail DMS', 'Retail VOC (Call Out)', 'Total Retail', 'L2R%']];
     for (const x of view.shown) aoa.push([x.d + ' ' + MONTHS[view.mon - 1] + ' ' + view.year, x.wd, x.l, x.rd, x.rc, x.r, +x.l2r.toFixed(2)]);
-    if (view.uL > 0 || view.uR > 0) aoa.push(['No day recorded', '', view.uL, view.nRd, view.nRc, view.uR, '']);
-    aoa.push(['∑ Total', '', view.tL, view.tRd, view.tRc, view.tR, +view.l2r.toFixed(2)]);
-    exportXlsx({ ['Day on Day ' + sel + (upd ? ' OU' : ' OC')]: aoa }, 'Jawa_DayOnDay_' + sel.replace("'", '') + (upd ? '_OnUpdate' : '_OnCreate'));
+    if (view.uL > 0 || view.uR > 0) aoa.push([noDayLabel, '', view.uL, view.nRd, view.nRc, view.uR, '']);
+    aoa.push(['\u2211 Total', '', view.tL, view.tRd, view.tRc, view.tR, +view.l2r.toFixed(2)]);
+    const base = 'Day on Day ' + sel + (upd ? ' OU' : ' OC');
+    const fname = 'Jawa_DayOnDay_' + sel.replace("'", '') + (upd ? '_OnUpdate' : '_OnCreate');
+    const ym = view.year * 100 + view.mon;
+    if (!(dx && dx.months.includes(ym))) { exportXlsx({ [base]: aoa }, fname); return; }
+
+    // Full detail for the filtered selection (same filters and rules as the tab).
+    const P = dailyPreds(dx, filters, maps);
+    const setTxt = (s, all) => (s && s.size ? [...s].join(', ') : all);
+    const fl = [['TVS Day on Day export'], [],
+      ['Month', sel], ['Basis', upd ? 'On Update (leads on creation day; retails on retail/attribution day)' : 'On Create (retails on the creation day of the lead)'],
+      ['Retail type shown', RT === 'dms' ? 'DMS only' : RT === 'co' ? 'Call Out (VOC) only' : 'DMS + Call Out (VOC)'],
+      ['Lead Type', setTxt(filters.leadTypes, 'All')], ['Source', setTxt(filters.sources, 'All')], ['Model', setTxt(filters.models, 'All')],
+      ['State', setTxt(filters.states, 'All')], ['City', setTxt(filters.cities, 'All')],
+      ['Purchased Model (retails only)', setTxt(filters.purchasedModels, 'All')], [],
+      ['Leads', view.tL], ['Retail DMS', view.tRd], ['Retail VOC (Call Out)', view.tRc], ['Total Retail', view.tR], ['L2R%', +view.l2r.toFixed(2)], [],
+      ['Sheets', 'Day on Day | By Model | By Source | By Lead Type | By State | By City | By Purchased Model | Lead detail | Retail detail'],
+      ['Note', 'Leads follow every filter except Purchased Model. When a Purchased Model is selected, retails follow it instead of the (enquired) Model filter. Data is aggregated (no lead-level rows).']];
+
+    const A = dx.L, B = dx.R, K = upd ? B.ud : B.cd;
+    const M = dx.maps, CN = dx.cityName;
+    const leadRows = [['Lead creation date', 'Model', 'Source', 'Lead Type', 'State', 'City', 'Leads']];
+    const acc = { mdl: new Map(), src: new Map(), lt: new Map(), st: new Map(), city: new Map(), pm: new Map() };
+    const bump = (m, k, i, v) => { let e = m.get(k); if (!e) { e = [0, 0, 0]; m.set(k, e); } e[i] += v; };
+    for (let i = 0; i < A.n.length; i++) {
+      if (Math.floor(A.d[i] / 100) !== ym) continue;
+      if (!(P.okM[A.mi[i]] && P.okS[A.si[i]] && P.okT[A.lt[i]] && P.okSt[A.st[i]] && P.okC[A.ci[i]])) continue;
+      leadRows.push([dayTxt(A.d[i]), M.mdl[A.mi[i]], M.src[A.si[i]], M.lt[A.lt[i]], M.st[A.st[i]], CN[A.ci[i]], A.n[i]]);
+      bump(acc.mdl, M.mdl[A.mi[i]], 0, A.n[i]); bump(acc.src, M.src[A.si[i]], 0, A.n[i]); bump(acc.lt, M.lt[A.lt[i]], 0, A.n[i]);
+      bump(acc.st, M.st[A.st[i]], 0, A.n[i]); bump(acc.city, CN[A.ci[i]], 0, A.n[i]);
+    }
+    const retRows = [['Lead creation date', 'Retail date', 'Model (enquired)', 'Source', 'Lead Type', 'State', 'City', 'Purchased Model', 'Retail type', 'Retails']];
+    for (let i = 0; i < B.n.length; i++) {
+      if (Math.floor(K[i] / 100) !== ym || B.rt[i] === 2) continue;
+      if (B.rt[i] === 0 ? !showD : !showC) continue;
+      if (!((P.pmSel || P.okM[B.mi[i]]) && P.okS[B.si[i]] && P.okT[B.lt[i]] && P.okSt[B.st[i]] && P.okC[B.ci[i]])) continue;
+      if (P.pmSel && !P.pmSel.has(B.pm[i])) continue;
+      const rt = B.rt[i] === 0 ? 'DMS' : 'Call Out (VOC)', slot = B.rt[i] === 0 ? 1 : 2;
+      retRows.push([dayTxt(B.cd[i]), dayTxt(B.ud[i]), M.mdl[B.mi[i]], M.src[B.si[i]], M.lt[B.lt[i]], M.st[B.st[i]], CN[B.ci[i]], M.mdl[B.pm[i]], rt, B.n[i]]);
+      bump(acc.mdl, M.mdl[B.mi[i]], slot, B.n[i]); bump(acc.src, M.src[B.si[i]], slot, B.n[i]); bump(acc.lt, M.lt[B.lt[i]], slot, B.n[i]);
+      bump(acc.st, M.st[B.st[i]], slot, B.n[i]); bump(acc.city, CN[B.ci[i]], slot, B.n[i]); bump(acc.pm, M.mdl[B.pm[i]], slot, B.n[i]);
+    }
+    const byDim = (title, m, withLeads) => {
+      const rows = [...m.entries()].sort((x, y) => (y[1][0] + y[1][1] + y[1][2]) - (x[1][0] + x[1][1] + x[1][2]));
+      const out = [withLeads ? [title, 'Leads', 'Retail DMS', 'Retail VOC (Call Out)', 'Total Retail', 'L2R%'] : [title, 'Retail DMS', 'Retail VOC (Call Out)', 'Total Retail']];
+      let tl = 0, td = 0, tc = 0;
+      for (const [k, v] of rows) {
+        tl += v[0]; td += v[1]; tc += v[2];
+        out.push(withLeads ? [k, v[0], v[1], v[2], v[1] + v[2], pct(v[0], v[1] + v[2])] : [k, v[1], v[2], v[1] + v[2]]);
+      }
+      out.push(withLeads ? ['\u2211 Total', tl, td, tc, td + tc, pct(tl, td + tc)] : ['\u2211 Total', td, tc, td + tc]);
+      return out;
+    };
+    exportXlsx({
+      'Filters': fl, [base]: aoa,
+      'By Model': byDim('Model', acc.mdl, true), 'By Source': byDim('Source', acc.src, true), 'By Lead Type': byDim('Lead Type', acc.lt, true),
+      'By State': byDim('State', acc.st, true), 'By City': byDim('City', acc.city, true),
+      'By Purchased Model': byDim('Purchased Model', acc.pm, false),
+      'Lead detail': leadRows, 'Retail detail': retRows,
+    }, fname + '_AllData');
   };
 
   const navBtn = (label, disabled, onClick) => ce('button', {
@@ -3739,7 +3943,7 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
       (upd
         ? '📅 On Update: leads are counted on the day they were created; retails on the day they were attributed (attribution date), so the month total matches the Overview. '
         : '📅 On Create: leads are counted on the day they were created and retails are attributed to that creation day (recent days keep converting, so their L2R% rises). ') +
-      'Model, Source and Lead Type filters apply' + (filtersNA ? ' — State, City and Purchased Model filters do not apply to this tab' : '') + '.');
+      (view.exact ? 'All filters apply. Purchased Model only affects retails, and when it is selected retails follow it instead of the Model filter (leads still follow Model).' : 'Model, Source, Lead Type and State filters apply' + (filtersNA ? ' — City and Purchased Model filters are available for the latest 4 months only (not for ' + sel + ')' : '') + '.'));
 
   const msgCard = (icon, title, body) => ce('div', { className: 'fade-up' }, noteBar, navCard(false),
     ce('div', { className: 'card', style: { padding: '40px 24px', textAlign: 'center', color: '#64748B' } },
@@ -3750,24 +3954,24 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
   const totalsLine = 'For the selected filters the month total is ' + Nf(view.tL) + ' leads and ' + Nf(view.tR) + ' retails. ';
 
   // On Update before the pipeline has produced the retail-day table
-  if (upd && !ddu.length) return msgCard('â³', 'On Update daily detail will appear after the next pipeline run',
+  if (upd && !ddu.length) return msgCard('⏳', 'On Update daily detail will appear after the next pipeline run',
     'Switch to On Create to see the day-on-day view now.');
   // leads of this month cannot be placed on a day
-  if (view.last === 0 && view.uL > 0 && view.dR === 0) return msgCard('ðŸ—“ï¸', 'Daily detail is not available for ' + sel,
+  if (view.last === 0 && view.uL > 0 && view.dR === 0) return msgCard('🗓️', 'Daily detail is not available for ' + sel,
     'The source data for this month records only the lead month, not the day each lead was created. ' + totalsLine +
     "Apr'25 – Jan'26 and Jul'26 onwards have full daily detail.");
   // On Update: most of this month's retails carry no attribution day (history before the live retail sheet)
-  if (upd && view.uR > view.dR) return msgCard('ðŸ—“ï¸', 'On Update daily retail detail is not available for ' + sel,
+  if (upd && view.uR > view.dR) return msgCard('🗓️', 'On Update daily retail detail is not available for ' + sel,
     "The retail source only records the month for most of this month's retails, not the day. " + totalsLine +
     'Switch to On Create for the day-on-day view of this month, or pick Apr\'26 onwards for On Update.');
   if (view.last === 0) return msgCard('🔎', 'No leads for this selection in ' + sel, 'Try widening the Model, Source or Lead Type filters.');
 
   const KPIs = [
-    { label: 'Leads (month to date)', value: Nf(view.tL), sub: view.last + ' day' + (view.last === 1 ? '' : 's') + ' of data', color: '#5A3E1A' },
-    { label: upd ? 'Retails (by attribution date)' : 'Retails (of leads created)', value: Nf(view.tR), sub: 'DMS ' + Nf(view.tRd) + ' · VOC ' + Nf(view.tRc), color: '#B8741A' },
-    { label: 'L2R %', value: view.l2r.toFixed(1) + '%', sub: 'Retails ÷ Leads', color: '#F5A623' },
-    { label: 'Avg leads / day', value: Nf(Math.round(view.avgL)), sub: 'over days with data', color: '#7C3AED' },
-    { label: 'Peak day', value: view.peak ? Nf(view.peak.l) : '—', sub: view.peak ? view.peak.d + ' ' + MONTHS[view.mon - 1] + ' (' + view.peak.wd + ')' : '', color: '#059669' },
+    { label: 'Leads (month to date)', value: Nf(view.tL), sub: view.last + ' day' + (view.last === 1 ? '' : 's') + ' of data', color: '#5A3E1A', dl: view.cmp && fmtDelta(view.cmp.leads, '%') },
+    { label: upd ? 'Retails (by attribution date)' : 'Retails (of leads created)', value: Nf(view.tR), sub: 'DMS ' + Nf(view.tRd) + ' · VOC ' + Nf(view.tRc), color: '#B8741A', dl: view.cmp && fmtDelta(view.cmp.retails, '%') },
+    { label: 'L2R %', value: view.l2r.toFixed(1) + '%', sub: 'Retails ÷ Leads', color: '#F5A623', dl: view.cmp && fmtDelta(view.cmp.l2r, ' pp') },
+    { label: 'Avg leads / day', value: Nf(Math.round(view.avgL)), sub: 'over days with data', color: '#7C3AED', dl: view.cmp && fmtDelta(view.cmp.avg, '%') },
+    { label: 'Peak day', value: view.peak ? Nf(view.peak.l) : '—', sub: view.peak ? view.peak.d + ' ' + MONTHS[view.mon - 1] + ' (' + view.peak.wd + ')' : '', color: '#059669', dl: view.cmp && fmtDelta(view.cmp.peak, '%') },
   ];
 
   return ce('div', { className: 'fade-up' },
@@ -3778,7 +3982,9 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
         ce('div', { style: { position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: k.color, borderRadius: '12px 12px 0 0' } }),
         ce('div', { className: 'kpi-label' }, k.label),
         ce('div', { className: 'kpi-value' + (k.value.length > 7 ? ' kpi-long' : ''), style: { color: k.color } }, k.value),
-        ce('div', { className: 'kpi-sub', style: { color: k.color } }, k.sub)
+        ce('div', { className: 'kpi-sub', style: { color: k.color } }, k.sub),
+        k.dl && ce('div', { style: { marginTop: 5, fontSize: 11, fontWeight: 700, color: k.dl.up ? '#059669' : '#DC2626' } },
+          k.dl.txt, ce('span', { style: { fontWeight: 500, color: '#94A3B8' } }, ' vs ' + view.cmp.label))
       ))
     ),
     ce('div', { className: 'card', style: { padding: '16px 18px', marginBottom: 14 } },
@@ -3805,7 +4011,7 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
               ce('td', { style: { fontWeight: 700 } }, Nf(x.r)),
               ce('td', null, x.l > 0 ? Pf(x.l2r) : '—'))),
             (view.uL > 0 || view.uR > 0) && ce('tr', { key: 'noday' },
-              ce('td', { className: 'label', style: { color: '#94A3B8' } }, 'No day recorded'),
+              ce('td', { className: 'label', style: { color: '#94A3B8' } }, noDayLabel),
               ce('td', null, Nf(view.uL)),
               ce('td', { style: { color: '#B8741A', fontWeight: 700 } }, Nf(view.nRd)),
               ce('td', { style: { color: '#7C3AED', fontWeight: 700 } }, Nf(view.nRc)),
@@ -3822,7 +4028,9 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
         )
       ),
       (view.uL > 0 || view.uR > 0) && ce('div', { style: { marginTop: 8, fontSize: 11, color: '#94A3B8' } },
-        '"No day recorded" holds leads and retails whose source has no usable date for this month; they are included in the totals so the month ties to the Overview.')
+        (upd
+          ? '"' + noDayLabel + '" holds retails whose attribution date falls in the neighbouring month — mostly DMS retails dated the 1st of the next month, which the Overview credits to this month (month-close) — plus any without a day. They are included in the total so the month ties to the Overview.'
+          : '"No day recorded" holds leads and retails whose source has no usable date for this month; they are included in the totals so the month ties to the Overview.'))
     )
   );
 });
@@ -3920,7 +4128,7 @@ function App() {
       mxst: data.u_mxst, mlt: data.u_mlt, stlt: data.u_stlt, disp: data.u_disp, pmr: data.u_pmr || [],
       stcm: data.u_stcm, univ: data.u_univ,
       stdm: data.u_stdm, mxdl: data.u_mxdl, ltdl: data.u_ltdl,
-      cm: data.u_cm || [], csm: data.u_csm || [], cxm: data.u_cxm || [], cxsm: data.u_cxsm || [],
+      cm: data.u_cm || [], csm: data.u_csm || [], cxm: data.u_cxm || [], cxsm: data.u_cxsm || [], cslt: data.u_cslt || [],
       cdm: data.u_cdm || [], cdsm: data.u_cdsm || [],
     };
   }, [data, leadsMode]);
@@ -3997,7 +4205,8 @@ function App() {
 
   const tabContent = useMemo(() => {
     if (!effectiveData) return null;
-    const props = { data: effectiveData, filters, months, RT, viewerMode, leadsMode, pmMaps };
+    const props = { data: effectiveData, filters, months, RT, viewerMode, leadsMode, pmMaps,
+      onFiltersChange: f => startT(() => setFilters(f)), setRT, userKey: auth ? auth.email : '' };
     switch (tab) {
       case 'overview':    return ce(OverviewTab,      props);
       case 'daily':       return ce(DailyTab,         props);
@@ -4713,29 +4922,97 @@ const DispersionTab = React.memo(function DispersionTab({ data, filters, months,
    ════════════════════════════════════════════════════════════════════ */
 const COL_SEP = '\x00'; // null-char composite column key separator
 
-const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMaps }) {
+const MDL_OTHER = '(Other enquired models)';        // retails of other enquiries that bought the selected Purch. Model
+function pmMatchIdx(selPM, mdl, disp) {
+  // Purch. Model options are individual models (same names as the Model filter). A selection is matched to the model name;
+  // only a name that is not a model (an older saved Retail-Dispersion family name) falls back to the family match.
+  const sel = new Set();
+  if (!selPM || !selPM.size) return sel;
+  const up = v => String(v == null ? '' : v).trim().toUpperCase().replace(/^TVS\s+/, '');
+  const byName = new Map();
+  mdl.forEach((n, i) => { const k = up(n); if (!byName.has(k)) byName.set(k, []); byName.get(k).push(i); });
+  for (const s of selPM) {
+    const k = up(s);
+    if (byName.has(k)) byName.get(k).forEach(i => sel.add(i));
+    else mdl.forEach((n, i) => { if (up(disp[i]) === k) sel.add(i); });
+  }
+  return sel;
+}
+function resolvePmIdx(selPM, maps) { return pmMatchIdx(selPM, maps.mdl, maps.mdl_disp || []); }
+
+const PIVOT_TPL_KEY = email => 'tvs_ldr_pivot_tpl_v1:' + String(email || '').toLowerCase();
+function loadPivotTpls(email) {
+  try { const a = JSON.parse(localStorage.getItem(PIVOT_TPL_KEY(email)) || '[]'); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+function storePivotTpls(email, list) {
+  try { localStorage.setItem(PIVOT_TPL_KEY(email), JSON.stringify(list)); return true; }
+  catch (e) { return false; }
+}
+
+const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, leadsMode, pmMaps, onFiltersChange, setRT, userKey }) {
   const { maps } = data;
 
   const [rowDims,    setRowDims]    = useState(['mdl']);
   const [colDims,    setColDims]    = useState(['lm']);
-  const [metrics,    setMetrics]    = useState(['leads']);
+  const [metricsSel, setMetricsSel] = useState(['leads']);
   const [sortBy,     setSortBy]     = useState('__total__');
   const [sortDir,    setSortDir]    = useState('desc');
-  const [sortM,      setSortM]      = useState(null);   // value (Leads / Retails / Retail %...) the sort uses; null = first selected
+  const [sortM,      setSortM]      = useState(null);   // metric used when sorting by a column (null = first selected metric)
+  const [pctCols,    setPctCols]    = useState(() => new Set());   // columns shown as % of subtotal (key: column + metric)
+  const theadRef = useRef();
+  // Freeze panes: every header row sticks to the top of the table area (stacked below the row above it), the first column sticks to the left.
+  useEffect(() => {
+    const th = theadRef.current; if (!th) return;
+    let top = 0;
+    for (const tr of th.rows) {
+      for (const c of tr.cells) { c.style.position = 'sticky'; c.style.top = top + 'px'; c.style.zIndex = c.style.left ? '5' : '4'; }
+      top += tr.offsetHeight;
+    }
+  });
+  const [dFrom,      setDFrom]      = useState('');     // Date filter (YYYY-MM-DD), applies at lead-creation-day level
+  const [dTo,        setDTo]        = useState('');
   const [topN,       setTopN]       = useState(20);
   const [collapsed,  setCollapsed]  = useState(new Set());
   const [addRowOpen, setAddRowOpen] = useState(false);
   const [addColOpen, setAddColOpen] = useState(false);
+  const [tpls,       setTpls]       = useState(() => loadPivotTpls(userKey));
+  const [tplOpen,    setTplOpen]    = useState(false);
+  const [tplName,    setTplName]    = useState('');
+  const [tplActive,  setTplActive]  = useState('');
+  const [tplNote,    setTplNote]    = useState('');
+  const [tplSync,    setTplSync]    = useState('loading');   // loading | ok | offline
+
+  // Templates are kept in the user's account (access service); the browser copy is only a cache for instant/offline display.
+  useEffect(() => {
+    if (!userKey) return;
+    let dead = false;
+    const syncFlag = PIVOT_TPL_KEY(userKey) + ':synced';
+    apiGetTemplates(userKey).then(async srv => {
+      let list = srv, flagged = false;
+      try { flagged = localStorage.getItem(syncFlag) === '1'; } catch (e) {}
+      const local = loadPivotTpls(userKey);
+      if (!flagged && srv.length === 0 && local.length > 0) {   // one-time: move templates made before sync existed into the account
+        for (const t of local) list = await apiSaveTemplate(userKey, t);
+      }
+      try { localStorage.setItem(syncFlag, '1'); } catch (e) {}
+      storePivotTpls(userKey, list);
+      if (!dead) { setTpls(list); setTplSync('ok'); }
+    }).catch(() => { if (!dead) setTplSync('offline'); });
+    return () => { dead = true; };
+  }, [userKey]);
 
   const DIMS = useMemo(() => [
     { key:'lm',  label:'Month'     },
     { key:'mdl', label:'Model'     },
+    ...(data.pmr && data.pmr.length ? [{ key:'pmd', label:'Purch. Model' }] : []),
     { key:'src', label:'Source'    },
     { key:'st',  label:'State'     },
     { key:'lt',  label:'Lead Type' },
     { key:'city',label:'City'      },
     ...(maps.dl ? [{ key:'dl', label:'Dealer' }] : []),
-  ], [maps.dl]);
+    ...(data.dd && data.dd.length ? [{ key:'day', label:'Date' }] : []),
+  ], [maps.dl, data.dd]);
 
   const METRICS = [
     { key:'leads',  label:'Leads'     },
@@ -4745,6 +5022,8 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     { key:'call',   label:'Call-Out'  },
   ];
 
+  const PMX_V2 = (data.pmx_v || 1) >= 2;
+  const PMX_DIMS = PMX_V2 ? ['pmd', 'mdl', 'src', 'st', 'lt', 'city', 'dl', 'lm'] : ['pmd', 'mdl', 'src', 'st', 'lt', 'city', 'lm'];
   const ALL_MATS = [
     { key:'sm',   dims:['src','lm']             },
     { key:'mm',   dims:['mdl','src','lm']        },
@@ -4757,6 +5036,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     { key:'csm',  dims:['city','src','lm']       },
     { key:'cxm',  dims:['city','mdl','lm']          },
     { key:'cxsm', dims:['city','src','mdl','lm']   },
+    { key:'cslt', dims:['city','src','lt','lm']    },
     { key:'cdm',  dims:['city','dl','lm']        },
     { key:'cdsm', dims:['city','dl','src','lm']  },
     { key:'stcm', dims:['st','city','lm']        },
@@ -4764,11 +5044,28 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     { key:'stdm', dims:['st','dl','lm']          },
     { key:'mxdl', dims:['mdl','dl','lm']         },
     { key:'ltdl', dims:['lt','dl','lm']          },
+    { key:'pmr',  dims:['pmd','mdl','src','lm']  },   // purchased model x enquired model x source x month (retails only)
+    { key:'pmx',  dims: PMX_DIMS },   // same, with state / lead type / city (and dealer in v2) (retails only)
   ];
+  const PMR_DIMS = ['pmd', 'mdl', 'src', 'lm'];
 
+  // Date: the day-level table (data.dd) carries Date / Model / Source / Lead Type / State / Month only.
+  const ddHasSt = data.dd_v === 2;
+  // ddp / ddup (retails only) add the purchased model: [day, mdl, src, lt, st, pmd, R, Rd, Rc]
+  const DD_PM = ddHasSt && !!(data.ddp && data.ddp.length);
+  const DD_DIMS = [...(ddHasSt ? ['day', 'mdl', 'src', 'lt', 'st'] : ['day', 'mdl', 'src', 'lt']), ...(DD_PM ? ['pmd'] : []), 'lm'];
+  const dateOn = !!(dFrom || dTo);
   const matConfig = useMemo(() => {
     const needed = [...rowDims, ...colDims];
     if (new Set(needed).size < needed.length) return null; // any dim repeated
+    if (needed.includes('day') || dateOn) {
+      return needed.every(d => DD_DIMS.includes(d)) && data.dd && data.dd.length ? { key:'dd', dims: DD_DIMS } : null;
+    }
+    if (needed.includes('pmd')) {                          // Purch. Model: only the pmx (or older pmr) matrix carries it
+      const full = !!(data.pmx && data.pmx.length);
+      const ds = full ? PMX_DIMS : PMR_DIMS;
+      return needed.every(d => ds.includes(d)) ? ALL_MATS.find(m => m.key === (full ? 'pmx' : 'pmr')) : null;
+    }
     // Include active filter dims so the selected matrix can honour them
     const filterDims = [];
     if (filters.models    && filters.models.size    > 0) filterDims.push('mdl');
@@ -4776,26 +5073,102 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     if (filters.leadTypes && filters.leadTypes.size > 0) filterDims.push('lt');
     if (filters.cities    && filters.cities.size    > 0) filterDims.push('city');
     if (filters.sources   && filters.sources.size   > 0) filterDims.push('src');
-    const allNeeded = [...new Set([...needed, ...filterDims])];
-    let best = null, bestExtra = 99;
+    // Rows / Columns must be in the table. State can also come from a City column (a city has one state); State / City
+    // filters can also be applied through a dealer's main city. The table covering the most active filters wins;
+    // filters it cannot cover are reported in the yellow notice.
+    let best = null, bestScore = -1, bestExtra = 99;
     for (const m of ALL_MATS) {
-      if (!allNeeded.every(d => m.dims.includes(d))) continue;
+      if (m.key === 'pmr' || m.key === 'pmx') continue;
+      if (!needed.every(d => m.dims.includes(d) || (d === 'st' && (m.dims.includes('city') || m.dims.includes('dl'))) || (d === 'city' && m.dims.includes('dl')))) continue;
+      const score = filterDims.filter(f => m.dims.includes(f)
+        || (f === 'st'   && (m.dims.includes('city') || m.dims.includes('dl')))
+        || (f === 'city' && m.dims.includes('dl'))).length;
       const extra = m.dims.filter(d => !needed.includes(d) && d !== 'lm').length;
-      if (extra < bestExtra || (extra === bestExtra && m.dims.length < (best?.dims.length ?? 99))) {
-        bestExtra = extra; best = m;
+      if (score > bestScore || (score === bestScore && (extra < bestExtra || (extra === bestExtra && m.dims.length < (best?.dims.length ?? 99))))) {
+        bestScore = score; bestExtra = extra; best = m;
       }
     }
     return best;
-  }, [rowDims, colDims, filters]);
+  }, [rowDims, colDims, filters, data.pmx, dateOn, data.dd, DD_PM]);
+
+  const isPmr = matConfig?.key === 'pmr' || matConfig?.key === 'pmx';
+  const stViaCity = !!matConfig && matConfig.dims.includes('city') && !matConfig.dims.includes('st') && !isPmr
+    && ([...rowDims, ...colDims].includes('st') || filters.states?.size > 0);
+  const isPmrOld = matConfig?.key === 'pmr';
+  const upd = leadsMode === 'update';
+  const pmFilterOn = !!(filters.purchasedModels && filters.purchasedModels.size > 0);
+  const hasDl = [...rowDims, ...colDims].includes('dl');
+  // The chosen table carries Dealer (even if Dealer is not in the pivot): State / City then follow the dealer's main city.
+  const usesDl = !!matConfig && matConfig.dims.includes('dl');
+  // Purch. Model filter + the exact table: leads come from the normal matrix, retails from pmx (any State / Lead Type / City / Month / Source / Model).
+  const pmxMode = pmFilterOn && !isPmr && !!(data.pmx && data.pmx.length) && !!matConfig && matConfig.key !== 'dd' && (!hasDl || PMX_V2);
+  const usePmx = matConfig?.key === 'pmx' || pmxMode;
+  // pmx row v1: [pmi, mi, si, sti, tti, cti, create-month, retail-month, R, Rd, Rc]; v2 adds dli after cti.
+  // Both become [...dims, month, 0 leads, R, Rd, Rc] in PMX_DIMS order.
+  const pmxBase = useMemo(() => !usePmx ? null
+    : PMX_V2 ? data.pmx.map(x => [x[0], x[1], x[2], x[3], x[4], x[5], x[6], upd ? x[8] : x[7], 0, x[9], x[10], x[11]])
+             : data.pmx.map(x => [x[0], x[1], x[2], x[3], x[4], x[5], upd ? x[7] : x[6], 0, x[8], x[9], x[10]]), [usePmx, data.pmx, upd, PMX_V2]);
+  const PMR_NO = ['leads', 'retpct'];   // a lead has no purchased model until it retails
+  const ddPmDim = matConfig?.key === 'dd' && DD_PM && [...rowDims, ...colDims].includes('pmd');
+  const metrics = useMemo(() => {
+    if (!isPmr && !ddPmDim) return metricsSel;
+    const m = metricsSel.filter(k => !PMR_NO.includes(k));
+    return m.length ? m : ['ret'];
+  }, [metricsSel, isPmr, ddPmDim]);
+
+  // Day-level rows -> [day, mdl, src, lt, (st), month, leads, R, Rd, Rc]. On Update: leads on the creation day, retails on the day they were attributed.
+  const ddMatrix = useMemo(() => {
+    if (matConfig?.key !== 'dd') return null;
+    const o = ddHasSt ? 1 : 0, pz = DD_PM ? [0] : [];
+    const pmRet = DD_PM && (ddPmDim || pmFilterOn);      // retails come from ddp / ddup, which carry the purchased model
+    const lmIdx = new Map((maps.lm || []).map((l, i) => [l, i]));
+    const lmOf = day => { const y = Math.floor(day / 10000) % 100, m = Math.floor(day / 100) % 100;
+      const i = lmIdx.get(MONTHS[m - 1] + "'" + String(y).padStart(2, '0')); return i == null ? -1 : i; };
+    const out = [];
+    if (!ddPmDim) for (const r of data.dd) {
+      const k = r.slice(0, 4 + o);
+      const z = upd || pmRet;
+      out.push([...k, ...pz, lmOf(r[0]), r[4 + o] || 0, z ? 0 : (r[5 + o] || 0), z ? 0 : (r[6 + o] || 0), z ? 0 : (r[7 + o] || 0)]);
+    }
+    if (upd && !pmRet) for (const r of (data.ddu || [])) {
+      const k = r.slice(0, 4 + o);
+      out.push([...k, ...pz, lmOf(r[0]), 0, r[4 + o] || 0, r[5 + o] || 0, r[6 + o] || 0]);
+    }
+    if (pmRet) {
+      // a trailing 1 marks Purch. Model retails: with a Purch. Model filter they ignore the Model filter (it applies to leads only)
+      const sel = pmFilterOn ? resolvePmIdx(filters.purchasedModels, maps) : null;
+      for (const r of ((upd ? data.ddup : data.ddp) || [])) {
+        if (sel && !sel.has(r[5])) continue;
+        out.push([r[0], r[1], r[2], r[3], r[4], r[5], lmOf(r[0]), 0, r[6] || 0, r[7] || 0, r[8] || 0, pmFilterOn ? 1 : 0]);
+      }
+    }
+    return out;
+  }, [matConfig, data.dd, data.ddu, data.ddp, data.ddup, upd, ddHasSt, maps, DD_PM, ddPmDim, pmFilterOn, filters.purchasedModels]);
 
   const rawMatrix = useMemo(() => {
     if (!matConfig) return [];
+    if (matConfig.key === 'dd') return ddMatrix || [];
+    if (matConfig.key === 'pmx') {
+      if (!pmxBase) return [];
+      if (!pmFilterOn) return pmxBase;
+      const sel = resolvePmIdx(filters.purchasedModels, maps);
+      return pmxBase.filter(x => sel.has(x[0]));
+    }
+    if (matConfig.key === 'pmr') {
+      const selOn = filters.purchasedModels && filters.purchasedModels.size > 0;
+      const sel = resolvePmIdx(filters.purchasedModels, maps);
+      const out = [];
+      for (const x of (data.pmr || [])) {      // [pmi, mi, si, li, R, Rd, Rc] -> [pmi, mi, si, li, leads, R, Rd, Rc]
+        if (selOn && !sel.has(x[0])) continue;
+        out.push([x[0], x[1], x[2], x[3], 0, x[4], x[5], x[6]]);
+      }
+      return out;
+    }
     return data[matConfig.key] || [];
-  }, [data, matConfig]);
+  }, [data, matConfig, filters.purchasedModels, maps, pmxBase, pmFilterOn, ddMatrix]);
 
-  const filterSets = useMemo(() => {
-    if (!matConfig) return {};
-    const { dims } = matConfig;
+  // skipModels: Purch. Model retails replace the Model filter (the filter then applies to leads only).
+  const buildSets = (dims, skipModels) => {
     const mk = (dim, fSet, arr) => {
       if (!dims.includes(dim) || !fSet || fSet.size === 0) return null;
       const s = new Set();
@@ -4806,15 +5179,57 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     const a = mk('lm',  filters.months,    maps.lm);  if (a) sets.lm  = a;
     const b = mk('src', filters.sources,   maps.src); if (b) sets.src = b;
     const c = mk('st',  filters.states,    maps.st);  if (c) sets.st  = c;
-    const d = mk('mdl', filters.models,    maps.mdl); if (d) sets.mdl = d;
+    const d = skipModels ? null : mk('mdl', filters.models, maps.mdl); if (d) sets.mdl = d;
     const e = mk('lt',  filters.leadTypes, maps.lt);  if (e) sets.lt  = e;
-    if (dims.includes('city') && filters.cities?.size > 0) {
+    const stOnCity = dims.includes('city') && !dims.includes('st') && filters.states?.size > 0;   // State filter applied through the city's state
+    if (dims.includes('city') && (filters.cities?.size > 0 || stOnCity)) {
       const cs = new Set();
-      (maps.city || []).forEach((v, i) => { if (filters.cities.has(v)) cs.add(i); });
-      if (cs.size) sets.city = cs;
+      (maps.city || []).forEach((v, i) => {
+        if (filters.cities?.size > 0 && !filters.cities.has(v)) return;
+        if (stOnCity) { const sti = (maps.city_state || [])[i]; if (sti == null || !filters.states.has((maps.st || [])[sti])) return; }
+        cs.add(i);
+      });
+      sets.city = cs;
     }
     return sets;
-  }, [matConfig, filters, maps]);
+  };
+  const filterSets = useMemo(() => matConfig ? buildSets(matConfig.dims, false) : {}, [matConfig, filters, maps]);
+
+  // Dealer rows when the chosen table has no State / City: keep only dealers whose main city (most leads) matches.
+  const dlHomeFor = (needSt, needCt) => {
+    if (!needSt && !needCt) return null;
+    const home = new Map(), best = new Map();
+    for (const r of (data.cdm || [])) {
+      const l = r[r.length - 4];
+      if (l > (best.get(r[1]) || 0)) { best.set(r[1], l); home.set(r[1], r[0]); }
+    }
+    const ok = new Set();
+    for (const [dli, cti] of home) {
+      if (needCt && !filters.cities.has((maps.city || [])[cti])) continue;
+      if (needSt) { const sti = (maps.city_state || [])[cti]; if (sti == null || !filters.states.has((maps.st || [])[sti])) continue; }
+      ok.add(dli);
+    }
+    return ok;
+  };
+  const dlHomeOk = useMemo(() => !matConfig || !usesDl ? null : dlHomeFor(
+      filters.states?.size > 0 && !matConfig.dims.includes('st') && !matConfig.dims.includes('city'),
+      filters.cities?.size > 0 && !matConfig.dims.includes('city')),
+    [matConfig, usesDl, filters, data.cdm, maps]);
+  // Purch. Model retails by Dealer: State / City follow the dealer's main city, the same as the leads side.
+  const dlHomePm = dlHomeOk;
+  // Dealer -> main city / state (used when State or City is shown next to Dealer in a table that has neither)
+  const homeMaps = useMemo(() => {
+    const city = new Map(), st = new Map(), best = new Map();
+    if (!usesDl) return { city, st };
+    for (const r of (data.cdm || [])) {
+      const l = r[r.length - 4];
+      if (l > (best.get(r[1]) || 0)) { best.set(r[1], l); city.set(r[1], r[0]); }
+    }
+    for (const [dli, cti] of city) st.set(dli, (maps.city_state || [])[cti]);
+    return { city, st };
+  }, [usesDl, data.cdm, maps]);
+  const stFromDl   = !!matConfig && usesDl && !matConfig.dims.includes('st') && !matConfig.dims.includes('city');
+  const cityFromDl = !!matConfig && usesDl && !matConfig.dims.includes('city');
 
   function getMetricVal(vals, m) {
     if (!vals) return 0;
@@ -4860,7 +5275,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
   // Purch. Model filter: pmr only carries (enquired model, source, month), so retails can be
   // restricted to the chosen purchased models exactly only when the pivot uses just those dims.
   const pmInfo = useMemo(() => {
-    if (!pmMaps || !matConfig) return null;
+    if (!pmMaps || !matConfig || isPmr || pmxMode || matConfig.key === 'dd') return null;
     const dims = matConfig.dims;
     const pivotDims = [...rowDims, ...colDims];
     const capable = pivotDims.every(d => d === 'mdl' || d === 'src' || d === 'lm');
@@ -4873,7 +5288,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     }
     const otherFilters = (filters.states?.size > 0) || (filters.leadTypes?.size > 0) || (filters.cities?.size > 0);
     return { keyOf, map, blocked: !keyOf, approx: !!keyOf && otherFilters };
-  }, [pmMaps, matConfig, rowDims, colDims, filters]);
+  }, [pmMaps, matConfig, rowDims, colDims, filters, isPmr, pmxMode]);
 
   // tbl: Map<r1Label, { sub: Map<cKey,vals>, children: Map<r2Label, Map<cKey,vals>> }>
   // cKey is colDims[0] label when 1 col dim, or "c0\x00c1" when 2 col dims
@@ -4881,11 +5296,23 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     if (!matConfig || rawMatrix.length === 0) return null;
     const { dims } = matConfig;
     const nDims = dims.length;
-    const rPos0 = dims.indexOf(rowDims[0]);
-    const rPos1 = rowDims[1] ? dims.indexOf(rowDims[1]) : -1;
-    const cPos0 = dims.indexOf(colDims[0]);
-    const cPos1 = colDims[1] ? dims.indexOf(colDims[1]) : -1;
-    const lbl   = (dim, idx) => (maps[dim] || [])[idx] ?? '#' + idx;
+    const stP = stViaCity ? dims.indexOf('city') : -1;
+    const dlP = dims.indexOf('dl');
+    // -2: State from the row's city; -3 / -4: State / City from the dealer's main city
+    const posOf = d => d === 'st' && stP >= 0 ? -2 : d === 'st' && stFromDl ? -3 : d === 'city' && cityFromDl ? -4 : dims.indexOf(d);
+    const rPos0 = posOf(rowDims[0]);
+    const rPos1 = rowDims[1] ? posOf(rowDims[1]) : -1;
+    const cPos0 = posOf(colDims[0]);
+    const cPos1 = colDims[1] ? posOf(colDims[1]) : -1;
+    const dayLbl = n => { const d = n % 100, ym = Math.floor(n / 100), y = Math.floor(ym / 100), m = ym % 100;
+      return d === 0 ? 'No day \u00B7 ' + MONTHS[m - 1] + "'" + String(y % 100).padStart(2, '0')
+                     : y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0'); };
+    const lbl   = (dim, idx) => dim === 'day' ? dayLbl(idx) : ((dim === 'pmd' ? maps.mdl : maps[dim]) || [])[idx] ?? '#' + idx;
+    const dayP  = dims.indexOf('day');
+    const fromN = dFrom ? +dFrom.replace(/-/g, '') : 0, toN = dTo ? +dTo.replace(/-/g, '') : 99999999;
+    const at    = (row, pos) => pos === -2 ? (maps.city_state || [])[row[stP]]
+                              : pos === -3 ? homeMaps.st.get(row[dlP])
+                              : pos === -4 ? homeMaps.city.get(row[dlP]) : row[pos];
 
     const tbl    = new Map();
     const colSet = new Set();
@@ -4893,20 +5320,25 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
 
     for (const row of rawMatrix) {
       let ok = true;
+      const pmRow = row[nDims + 4] === 1;      // day matrix: a Purch. Model retail row (see ddMatrix)
       for (const [dim, allowed] of Object.entries(filterSets)) {
         const pos = dims.indexOf(dim);
         if (pos < 0) continue;
+        if (pmRow && dim === 'mdl') continue;
         if (!allowed.has(row[pos])) { ok = false; break; }
       }
       if (!ok) continue;
+      if (dlHomeOk && !dlHomeOk.has(row[dims.indexOf('dl')])) continue;
+      if (dateOn && dayP >= 0 && (row[dayP] % 100 === 0 || row[dayP] < fromN || row[dayP] > toN)) continue;
 
-      const r1 = lbl(rowDims[0], row[rPos0]);
-      const r2 = rPos1 >= 0 ? lbl(rowDims[1], row[rPos1]) : null;
-      const c0 = lbl(colDims[0], row[cPos0]);
-      const ck = cPos1 >= 0 ? c0 + COL_SEP + lbl(colDims[1], row[cPos1]) : c0;
+      const lb2 = (dim, pos) => (pmRow && dim === 'mdl' && filters.models?.size > 0 && !filters.models.has(maps.mdl[row[pos]])) ? MDL_OTHER : lbl(dim, at(row, pos));
+      const r1 = lb2(rowDims[0], rPos0);
+      const r2 = rowDims[1] ? lb2(rowDims[1], rPos1) : null;
+      const c0 = lb2(colDims[0], cPos0);
+      const ck = colDims[1] ? c0 + COL_SEP + lb2(colDims[1], cPos1) : c0;
       colSet.add(ck);
 
-      let ov = null;
+      let ov = pmxMode ? [0, 0, 0] : null;      // retails come from the second pass
       if (pmInfo) {
         if (pmInfo.keyOf) {
           const k = pmInfo.keyOf(row);
@@ -4923,11 +5355,41 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
         accVals(e.children.get(r2), ck, row, nDims, ov);
       }
     }
+    if (pmxMode && pmxBase) {
+      const sel = resolvePmIdx(filters.purchasedModels, maps);
+      const sets = buildSets(PMX_DIMS, true);
+      if (usesDl && dlHomePm) { delete sets.st; delete sets.city; }   // leads side uses the dealer's main city: do the same here
+      const modelsOn = !!(filters.models && filters.models.size > 0);
+      const pp = d => PMX_DIMS.indexOf(d);
+      const rp0 = pp(rowDims[0]), rp1 = rowDims[1] ? pp(rowDims[1]) : -1, cp0 = pp(colDims[0]), cp1 = colDims[1] ? pp(colDims[1]) : -1;
+      const dlq = pp('dl');
+      const pv = (dim, row, pos) => usesDl && stFromDl && dim === 'st' ? homeMaps.st.get(row[dlq])
+                                  : usesDl && cityFromDl && dim === 'city' ? homeMaps.city.get(row[dlq]) : row[pos];
+      const lb = (dim, row, pos) => (dim === 'mdl' && modelsOn && !filters.models.has(maps.mdl[row[pos]])) ? MDL_OTHER : lbl(dim, pv(dim, row, pos));
+      for (const row of pmxBase) {
+        if (!sel.has(row[0])) continue;
+        let ok = true;
+        for (const [dim, allowed] of Object.entries(sets)) if (!allowed.has(row[pp(dim)])) { ok = false; break; }
+        if (!ok) continue;
+        if (usesDl && dlHomePm && !dlHomePm.has(row[pp('dl')])) continue;
+        const r1 = lb(rowDims[0], row, rp0);
+        const r2 = rp1 >= 0 ? lb(rowDims[1], row, rp1) : null;
+        const c0 = lb(colDims[0], row, cp0);
+        const ck = cp1 >= 0 ? c0 + COL_SEP + lb(colDims[1], row, cp1) : c0;
+        colSet.add(ck);
+        if (!tbl.has(r1)) tbl.set(r1, { sub: new Map(), children: new Map() });
+        const e = tbl.get(r1);
+        accVals(e.sub, ck, row, PMX_DIMS.length);
+        if (r2 !== null) {
+          if (!e.children.has(r2)) e.children.set(r2, new Map());
+          accVals(e.children.get(r2), ck, row, PMX_DIMS.length);
+        }
+      }
+    }
     return { tbl, colLabels: [...colSet] };
-  }, [rawMatrix, matConfig, rowDims, colDims, filterSets, maps, pmInfo]);
+  }, [rawMatrix, matConfig, rowDims, colDims, filterSets, maps, pmInfo, pmxMode, pmxBase, filters, dlHomeOk, dlHomePm, stViaCity, homeMaps, stFromDl, cityFromDl, dFrom, dTo, dateOn]);
 
   const pm = metrics[0] || 'leads'; // primary metric drives column ordering + sorting
-  const sm = (sortM && metrics.includes(sortM)) ? sortM : pm;   // metric the row sort uses
 
   const orderedCols = useMemo(() => {
     if (!pivotResult) return [];
@@ -4999,31 +5461,33 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     return groups;
   }, [orderedCols, colDims]);
 
+  const sm = sortM && metrics.includes(sortM) ? sortM : pm;   // metric the current column sort refers to
   const sortedRows = useMemo(() => {
     if (!pivotResult) return [];
     const rows = [];
     for (const [label, entry] of pivotResult.tbl) {
-      const total = rowTotal(entry.sub, sm);
+      const total = rowTotal(entry.sub, sortBy === '__total__' || sortBy === '__label2__' ? sm : pm);
       rows.push({ label, entry, total });
     }
     rows.sort((a, b) => {
-      let av, bv;
+      let av, bv, dir = sortDir;
       if (sortBy === '__total__') { av = a.total; bv = b.total; }
+      else if (sortBy === '__label2__') { av = a.total; bv = b.total; dir = 'desc'; }   // outer rows keep the biggest first
       else if (sortBy === '__label__') { av = a.label; bv = b.label; }
       else { av = getMetricVal(a.entry.sub.get(sortBy), sm); bv = getMetricVal(b.entry.sub.get(sortBy), sm); }
       if (av === bv) return 0;
-      if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
-      return sortDir === 'asc' ? av - bv : bv - av;
+      if (typeof av === 'string') return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      return dir === 'asc' ? av - bv : bv - av;
     });
     return topN > 0 ? rows.slice(0, topN) : rows;
   }, [pivotResult, pm, sm, sortBy, sortDir, topN]);
 
-  // child rows (e.g. the states under a model) use the same sort as the groups
-  const sortChildren = (children) => {
-    const arr = [...children.entries()];
+  // Second row dimension (children) follows the same Sort by / Order as the first.
+  function sortChildren(children) {
+    const arr = [...children];
     arr.sort((a, b) => {
       let av, bv;
-      if (sortBy === '__label__') { av = a[0]; bv = b[0]; }
+      if (sortBy === '__label__' || sortBy === '__label2__') { av = a[0]; bv = b[0]; }
       else if (sortBy === '__total__') { av = rowTotal(a[1], sm); bv = rowTotal(b[1], sm); }
       else { av = getMetricVal(a[1].get(sortBy), sm); bv = getMetricVal(b[1].get(sortBy), sm); }
       if (av === bv) return 0;
@@ -5031,13 +5495,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
       return sortDir === 'asc' ? av - bv : bv - av;
     });
     return arr;
-  };
-  // click a column header: sort by it (and its value); click again to flip Asc / Desc
-  const clickSort = (key, m) => {
-    if (sortBy === key && sm === m) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    else { setSortBy(key); setSortM(m); setSortDir('desc'); }
-  };
-  const sortArrow = (key, m) => (sortBy === key && sm === m) ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  }
 
   const grandTotals = useMemo(() => {
     if (!pivotResult) return { colVals: {}, gl: 0, gr: 0 };
@@ -5058,11 +5516,21 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     const ds  = new Set(matConfig.dims);
     const all = new Set([...rowDims, ...colDims]);
     const out = [];
+    const hasD = ds.has('dl');
     if (filters.sources?.size > 0 && !ds.has('src') && !all.has('src')) out.push('Source');
-    if (filters.states?.size  > 0 && !ds.has('st')  && !all.has('st'))  out.push('State');
+    if (filters.states?.size  > 0 && !ds.has('st')  && !all.has('st') && !ds.has('city') && !hasD)  out.push('State');
     if (filters.models?.size  > 0 && !ds.has('mdl') && !all.has('mdl')) out.push('Model');
+    if (matConfig.key !== 'pmr' && matConfig.key !== 'pmx') {
+      if (filters.leadTypes?.size > 0 && !ds.has('lt'))   out.push('Lead Type');
+      if (filters.cities?.size    > 0 && !ds.has('city') && !hasD) out.push('City');
+    }
+    if (matConfig.key === 'dd' && pmFilterOn && !DD_PM) out.push('Purch. Model');
+    if (matConfig.key === 'pmr') {
+      if (filters.leadTypes?.size > 0) out.push('Lead Type');
+      if (filters.cities?.size    > 0) out.push('City');
+    }
     return out;
-  }, [matConfig, filters, rowDims, colDims]);
+  }, [matConfig, filters, rowDims, colDims, pmFilterOn]);
 
   function toggleCollapse(label) {
     setCollapsed(prev => {
@@ -5073,11 +5541,68 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
   }
 
   function toggleMetric(key) {
-    setMetrics(prev =>
-      prev.includes(key)
-        ? prev.length > 1 ? prev.filter(k => k !== key) : prev
-        : [...prev, key]
-    );
+    const cur = metrics;
+    setMetricsSel(cur.includes(key) ? (cur.length > 1 ? cur.filter(k => k !== key) : cur) : [...cur, key]);
+  }
+
+  // ── Saved templates (per user, stored in this browser) ──
+  function saveTemplate() {
+    const name = tplName.trim();
+    if (!name) { setTplNote('Type a name first.'); return; }
+    const arr = s => [...(s || [])];
+    const t = { name, rows: rowDims, cols: colDims, metrics: metricsSel, sortBy, sortDir, topN, rt: RT, saved: Date.now(), dFrom, dTo,
+      filters: { months: arr(filters.months), leadTypes: arr(filters.leadTypes), sources: arr(filters.sources), models: arr(filters.models),
+                 states: arr(filters.states), cities: arr(filters.cities), purchasedModels: arr(filters.purchasedModels) } };
+    const next = [...tpls.filter(x => x.name.toLowerCase() !== name.toLowerCase()), t].sort((a, b) => a.name.localeCompare(b.name));
+    storePivotTpls(userKey, next);
+    setTpls(next); setTplActive(name); setTplName(''); setTplNote('Saving\u2026');
+    apiSaveTemplate(userKey, t)
+      .then(list => { storePivotTpls(userKey, list); setTpls(list); setTplSync('ok'); setTplNote('Saved "' + name + '" to your account.'); })
+      .catch(e => setTplNote('\u26A0 Not saved to your account: ' + (e && e.message ? e.message : 'server unreachable') + '. Press Save again to retry.'));
+  }
+
+  function applyTemplate(t) {
+    const keys = new Set(DIMS.map(d => d.key));
+    const rs = (t.rows || []).filter(k => keys.has(k)), cs = (t.cols || []).filter(k => keys.has(k));
+    setRowDims(rs.length ? rs : ['mdl']); setColDims(cs.length ? cs : ['lm']);
+    setMetricsSel((t.metrics || []).length ? t.metrics : ['leads']);
+    setSortBy(t.sortBy || '__total__'); setSortDir(t.sortDir || 'desc'); setSortM(null); setTopN(t.topN != null ? t.topN : 20);
+    setCollapsed(new Set());
+    setDFrom(t.dFrom || ''); setDTo(t.dTo || '');
+    const f = t.filters || {}, S = a => new Set(a || []);
+    onFiltersChange({ months: S(f.months), leadTypes: S(f.leadTypes), sources: S(f.sources), models: S(f.models),
+                      states: S(f.states), cities: S(f.cities), purchasedModels: S(f.purchasedModels) });
+    setRT(t.rt || 'all');
+    setTplActive(t.name); setTplOpen(false); setTplNote('');
+  }
+
+  // Back to the plain default pivot: Model x Month, Leads, no filters, no date range.
+  function resetPivot() {
+    setRowDims(['mdl']); setColDims(['lm']); setMetricsSel(['leads']);
+    setSortBy('__total__'); setSortDir('desc'); setSortM(null); setTopN(20);
+    setCollapsed(new Set()); setPctCols(new Set());
+    setDFrom(''); setDTo('');
+    onFiltersChange({ months: new Set(), leadTypes: new Set(), sources: new Set(), models: new Set(), states: new Set(), cities: new Set(), purchasedModels: new Set() });
+    setRT('all');
+    setTplActive(''); setTplOpen(false); setTplNote('');
+  }
+
+  function deleteTemplate(t) {
+    if (!window.confirm('Delete template "' + t.name + '"?')) return;
+    const next = tpls.filter(x => x.name !== t.name);
+    storePivotTpls(userKey, next); setTpls(next);
+    if (tplActive === t.name) setTplActive('');
+    apiDeleteTemplate(userKey, t.name)
+      .then(list => { storePivotTpls(userKey, list); setTpls(list); setTplSync('ok'); })
+      .catch(() => setTplNote('\u26A0 Could not delete on the server. Try again.'));
+  }
+
+  function tplSummary(t) {
+    const f = t.filters || {}, lab = k => DIMS.find(d => d.key === k)?.label || k;
+    const parts = [(t.rows || []).map(lab).join('+') + ' × ' + (t.cols || []).map(lab).join('+')];
+    [['months', 'month'], ['states', 'state'], ['models', 'model'], ['sources', 'source'], ['leadTypes', 'lead type'], ['cities', 'city'], ['purchasedModels', 'purch. model']]
+      .forEach(([k, w]) => { const n = (f[k] || []).length; if (n) parts.push(n + ' ' + w + (n > 1 ? 's' : '')); });
+    return parts.join(' · ');
   }
 
   function addRowDim(key) {
@@ -5140,7 +5665,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
       if (!hasR2) { const r = [label]; pushCells(r, entry.sub); aoa.push(r); }
       else {
         const rSub = [label, 'Subtotal']; pushCells(rSub, entry.sub); aoa.push(rSub);
-        for (const [r2Lbl, cMap] of entry.children) {
+        for (const [r2Lbl, cMap] of sortChildren(entry.children)) {
           const rChild = ['', r2Lbl]; pushCells(rChild, cMap); aoa.push(rChild);
         }
       }
@@ -5206,15 +5731,27 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     );
 
   const metricPill = m => {
-    const active = metrics.includes(m.key);
-    return ce('span', { key: m.key, onClick: () => toggleMetric(m.key),
-      style:{ display:'inline-flex', alignItems:'center', padding:'4px 10px',
-              borderRadius:20, fontSize:12, fontWeight:600, cursor:'pointer', userSelect:'none',
+    const off = isPmr && PMR_NO.includes(m.key);
+    const active = !off && metrics.includes(m.key);
+    return ce('span', { key: m.key, onClick: off ? undefined : () => toggleMetric(m.key),
+      title: off ? 'Not available by Purch. Model' : undefined,
+      style:{ display:'inline-flex', alignItems:'center', padding:'4px 10px', opacity: off ? 0.4 : 1,
+              borderRadius:20, fontSize:12, fontWeight:600, cursor: off ? 'not-allowed' : 'pointer', userSelect:'none',
               border: active ? '1.5px solid #1a3a5c' : '1.5px solid #CBD5E1',
               background: active ? '#1a3a5c' : '#fff',
               color: active ? '#fff' : '#475569' }
     }, m.label);
   };
+
+  // % of subtotal: child rows -> share of their group's subtotal; subtotal / single-level rows -> share of the grand total.
+  const pk = (ck, m) => ck + '\u0001' + m;
+  const isPct = (ck, m) => m !== 'retpct' && pctCols.has(pk(ck, m));
+  const togglePct = (ck, m) => setPctCols(prev => { const n = new Set(prev); const k = pk(ck, m); if (n.has(k)) n.delete(k); else n.add(k); return n; });
+  const pctStr = (v, d) => (d > 0 && v > 0) ? (v / d * 100).toFixed(1) + '%' : '—';
+  const grandNum = m => m === 'leads' ? grandTotals.gl : m === 'ret' ? grandTotals.gr
+    : Object.values(grandTotals.colVals).reduce((s, v) => s + getMetricVal(v, m), 0);
+  const cellV = (vals, m, ck, den) => isPct(ck, m) ? pctStr(getMetricVal(vals, m), getMetricVal(den, m)) : fmtV(vals, m);
+  const cellTot = (cMap, m, denMap) => isPct('__total__', m) ? pctStr(rowTotal(cMap, m), denMap ? rowTotal(denMap, m) : grandNum(m)) : fmtTotal(cMap, m);
 
   // ── Render ────────────────────────────────────────────────────────
   return ce('div', { style:{ padding:'0 4px' } },
@@ -5270,26 +5807,6 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
 
       ce('div', { style:{width:1,height:40,background:'#E2E8F0',alignSelf:'center',marginTop:20} }),
 
-      /* SORT — hide per-column sort when 2 col dims (composite keys aren't readable labels) */
-      ce('div', null,
-        ce('div', { style:{fontSize:10,fontWeight:700,color:'#64748B',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6} }, 'Sort By'),
-        ce('select', { value:sortBy, onChange:e=>setSortBy(e.target.value), style:selSt },
-          ce('option',{value:'__total__'},'Total'),
-          ce('option',{value:'__label__'},'Row Label'),
-          ...(!hasC2 ? orderedCols.slice(0,8).map(c => ce('option',{key:c,value:c}, c.length>15?c.slice(0,14)+'…':c)) : [])
-        )
-      ),
-
-      ce('div', null,
-        ce('div', { style:{fontSize:10,fontWeight:700,color:'#64748B',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6} }, 'Order'),
-        ce('div', { style:{ display:'flex', gap:4 } },
-          ['asc','desc'].map(d => ce('button', { key:d, onClick:()=>setSortDir(d), title: d==='asc' ? 'Ascending (low to high)' : 'Descending (high to low)',
-            style:{ ...selSt, cursor:'pointer', fontWeight:700, padding:'6px 12px',
-                    background: sortDir===d ? '#B8741A' : '#fff', color: sortDir===d ? '#fff' : '#475569',
-                    border: '1px solid ' + (sortDir===d ? '#B8741A' : '#CBD5E1') } }, d==='asc' ? '▲ Asc' : '▼ Desc'))
-        )
-      ),
-
       ce('div', null,
         ce('div', { style:{fontSize:10,fontWeight:700,color:'#64748B',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6} }, 'Show'),
         ce('select', { value:topN, onChange:e=>setTopN(+e.target.value), style:selSt },
@@ -5301,16 +5818,66 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
         )
       ),
 
-      !unsupported && !noData && !awaitingPipeline &&
-        ce('div', { style:{marginLeft:'auto',alignSelf:'flex-end',paddingTop:20} },
-          ce(ExportBtn, { onClick: handleExport })
+      data.dd && data.dd.length > 0 && ce('div', null,
+        ce('div', { style:{fontSize:10,fontWeight:700,color:'#64748B',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6} }, 'Date (lead created)'),
+        ce('div', { style:{ display:'flex', gap:6, alignItems:'center' } },
+          ce('input', { type:'date', value:dFrom, max:dTo || undefined, onChange:e=>setDFrom(e.target.value), title:'From date', style:{ ...selSt, cursor:'text' } }),
+          ce('span', { style:{ color:'#94A3B8', fontSize:12 } }, 'to'),
+          ce('input', { type:'date', value:dTo, min:dFrom || undefined, onChange:e=>setDTo(e.target.value), title:'To date', style:{ ...selSt, cursor:'text' } }),
+          dateOn && ce('button', { onClick:()=>{ setDFrom(''); setDTo(''); }, title:'Clear date filter',
+            style:{ fontSize:14, background:'none', border:'none', color:'#64748B', cursor:'pointer' } }, '\u00D7')
+        )
+      ),
+
+      ce('div', { style:{ marginLeft:'auto', alignSelf:'flex-end', paddingTop:20, display:'flex', gap:8, alignItems:'center' } },
+        ce('div', { style:{ position:'relative' } },
+          ce('button', { onClick: () => { setTplOpen(o => !o); setTplNote(''); },
+            style:{ ...selSt, fontWeight:600, display:'inline-flex', gap:6, alignItems:'center', whiteSpace:'nowrap' } },
+            '\u2605 ' + (tplActive || 'My templates') + (tpls.length ? ' (' + tpls.length + ')' : ''), ' \u25BE'),
+          tplOpen && ce('div', { style:{ position:'absolute', top:'calc(100% + 4px)', right:0, zIndex:20, width:340,
+              background:'#fff', border:'1px solid #E2E8F0', borderRadius:10, boxShadow:'0 4px 16px rgba(0,0,0,0.14)', overflow:'hidden' } },
+            ce('div', { style:{ padding:'8px 14px', fontSize:10, fontWeight:700, color:'#64748B', textTransform:'uppercase', letterSpacing:'0.08em', background:'#F8FAFC' } }, 'Saved templates'),
+            tpls.length === 0 && ce('div', { style:{ padding:'12px 14px', fontSize:12, color:'#94A3B8' } },
+              (tplSync === 'loading' ? 'Loading your templates\u2026' : 'None yet. Set the filters and the Rows / Columns / Values you want, name it below and save.')),
+            ce('div', { style:{ maxHeight:260, overflowY:'auto' } },
+              tpls.map(t => ce('div', { key:t.name,
+                style:{ display:'flex', alignItems:'center', gap:8, padding:'8px 14px', cursor:'pointer',
+                        background: t.name === tplActive ? '#EFF6FF' : '', borderTop:'1px solid #F1F5F9' },
+                onMouseEnter: e => { if (t.name !== tplActive) e.currentTarget.style.background = '#F1F5F9'; },
+                onMouseLeave: e => { e.currentTarget.style.background = t.name === tplActive ? '#EFF6FF' : ''; },
+                onClick: () => applyTemplate(t) },
+                ce('div', { style:{ flex:1, minWidth:0 } },
+                  ce('div', { style:{ fontSize:13, fontWeight:600, color:'#0f172a', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' } }, t.name),
+                  ce('div', { style:{ fontSize:11, color:'#64748B', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' } }, tplSummary(t))),
+                ce('span', { title:'Delete template', style:{ color:'#94A3B8', fontSize:15, padding:'0 4px' },
+                  onClick: e => { e.stopPropagation(); deleteTemplate(t); } }, '\u00D7')
+              ))
+            ),
+            ce('div', { style:{ padding:'10px 14px', borderTop:'1px solid #E2E8F0', background:'#F8FAFC' } },
+              ce('div', { style:{ display:'flex', gap:6 } },
+                ce('input', { value:tplName, placeholder:'Template name', maxLength:40,
+                  onChange: e => setTplName(e.target.value),
+                  onKeyDown: e => { if (e.key === 'Enter') saveTemplate(); },
+                  style:{ ...selSt, flex:1, minWidth:0, cursor:'text' } }),
+                ce('button', { onClick: saveTemplate,
+                  style:{ padding:'6px 12px', fontSize:12, fontWeight:700, borderRadius:8, border:'none', cursor:'pointer', background:'#1a3a5c', color:'#fff', whiteSpace:'nowrap' } },
+                  'Save current view')),
+              ce('div', { style:{ fontSize:11, color: !tplNote ? '#94A3B8' : tplNote.startsWith('\u26A0') ? '#B91C1C' : '#166534', marginTop:6 } },
+                tplNote || 'Saves the current filters (month, state, model, source\u2026), Rows, Columns, Values and sort to your account \u2014 available on any browser or PC.'),
+              tplSync !== 'ok' && ce('div', { style:{ fontSize:11, marginTop:4, color: tplSync === 'offline' ? '#B45309' : '#94A3B8' } },
+                tplSync === 'loading' ? 'Loading your templates\u2026' : 'Could not reach your account \u2014 showing the copy saved in this browser.'))
+          )
         ),
+        tplActive && ce('button', { onClick: resetPivot, title: 'Clear the template: back to Model \u00D7 Month with no filters',
+          style:{ ...selSt, fontWeight:600, whiteSpace:'nowrap', color:'#8A5A12', borderColor:'#8A5A12' } }, '\u21BA Reset pivot'),
+        !unsupported && !noData && !awaitingPipeline && ce(ExportBtn, { onClick: handleExport })
+      ),
     ),
 
     /* click-away overlays for dropdowns */
-    (addRowOpen || addColOpen) && ce('div', {
+    (addRowOpen || addColOpen || tplOpen) && ce('div', {
       style:{position:'fixed',inset:0,zIndex:10},
-      onClick:()=>{ setAddRowOpen(false); setAddColOpen(false); }
+      onClick:()=>{ setAddRowOpen(false); setAddColOpen(false); setTplOpen(false); }
     }),
 
     /* ── Unapplied-filter warning ── */
@@ -5318,6 +5885,28 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
       style:{ padding:'7px 14px', background:'#FFF3CD', border:'1px solid #F5A623',
               borderRadius:8, fontSize:12, color:'#92400E', marginBottom:12 }
     }, `⚠  ${unapplied.join(', ')} filter${unapplied.length>1?'s':''} not applied — not a dimension in this matrix.`),
+
+    isPmr && ce('div', {
+      style:{ padding:'7px 14px', background:'#EFF6FF', border:'1px solid #D9BE8A',
+              borderRadius:8, fontSize:12, color:'#1E3A8A', marginBottom:12 }
+    }, isPmrOld
+      ? '\u24D8  Purch. Model view: shows Retails only (a lead has no purchased model until it retails). It can be combined with Model (enquired), Source and Month; State / Lead Type / City filters are not applied here.'
+      : '\u24D8  Purch. Model view: shows Retails only (a lead has no purchased model until it retails). It can be combined with Month, Model (enquired), Source, State, Lead Type and City.'),
+
+    matConfig?.key === 'dd' && ce('div', {
+      style:{ padding:'7px 14px', background:'#EFF6FF', border:'1px solid #D9BE8A',
+              borderRadius:8, fontSize:12, color:'#1E3A8A', marginBottom:12 }
+    }, '\u24D8  Date view: leads are counted on the day they were created; ' + (upd ? 'retails on the day they were attributed.' : 'retails are attributed to the lead\u2019s creation day.') + ' Date works with Month, Model, Source, Lead Type' + (ddHasSt ? ', State' : '') + (DD_PM ? ', Purch. Model (retails only)' : '') + '; City and Dealer' + (DD_PM ? '' : ' and Purch. Model') + ' are not available with Date. "No day" rows hold leads without a recorded day and are left out when a date range is set.'),
+
+    dlHomeOk && ce('div', {
+      style:{ padding:'7px 14px', background:'#EFF6FF', border:'1px solid #D9BE8A',
+              borderRadius:8, fontSize:12, color:'#1E3A8A', marginBottom:12 }
+    }, 'ⓘ  Dealer view: the State / City filters are applied through each dealer’s main city (the city where it has the most leads).'),
+
+    (pmxMode || (matConfig?.key === 'dd' && DD_PM && pmFilterOn)) && filters.models?.size > 0 && ce('div', {
+      style:{ padding:'7px 14px', background:'#EFF6FF', border:'1px solid #D9BE8A',
+              borderRadius:8, fontSize:12, color:'#1E3A8A', marginBottom:12 }
+    }, '\u24D8  Purch. Model is selected: the Model filter applies to leads only. Retails follow the purchased model; retails of other enquired models appear as "' + MDL_OTHER + '" when Model is a row or column.'),
 
     pmInfo && (pmInfo.blocked || pmInfo.approx) && ce('div', {
       style:{ padding:'7px 14px', background:'#FFF3CD', border:'1px solid #F5A623',
@@ -5330,6 +5919,8 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     unsupported && ce('div', { style:{ textAlign:'center', padding:50, color:'#94A3B8', fontSize:14 } },
       new Set(allDims).size < allDims.length
         ? 'A dimension cannot appear in both Rows and Columns.'
+        : allDims.includes('pmd')
+        ? (data.pmx && data.pmx.length ? (PMX_V2 ? 'This Purch. Model combination is not available.' : 'Purch. Model with Dealer needs the next pipeline run.') : 'Purch. Model can be combined only with Model, Source and Month.')
         : `The combination ${rowDims.map(k=>DIMS.find(d=>d.key===k)?.label||k).join(' + ')} × ${colDims.map(k=>DIMS.find(d=>d.key===k)?.label||k).join(' + ')} is not supported — no matching data matrix.`
     ),
 
@@ -5342,13 +5933,13 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
     ),
 
     /* ── Summary Grid ── */
-    !unsupported && !awaitingPipeline && !noData && grandTotals.gl > 0 &&
+    !unsupported && !awaitingPipeline && !noData && (grandTotals.gl > 0 || grandTotals.gr > 0) &&
     ce('div', { className:'card', style:{padding:'10px 18px',marginBottom:14,borderTop:'3px solid #5A3E1A'} },
       ce('div', { style:{display:'flex',flexWrap:'wrap',alignItems:'stretch'} },
         ...[
-          { label:'Total Leads', value:Nf(grandTotals.gl), color:'#5A3E1A' },
+          { label:'Total Leads', value:isPmr ? '\u2014' : Nf(grandTotals.gl), color:'#5A3E1A' },
           { label:'Retails',     value:Nf(grandTotals.gr), color:'#B8741A' },
-          { label:'L2R%', value:Pf(grandTotals.gl>0?grandTotals.gr/grandTotals.gl*100:0), color:'#D97706' },
+          { label:'L2R%', value:isPmr ? '\u2014' : Pf(grandTotals.gl>0?grandTotals.gr/grandTotals.gl*100:0), color:'#D97706' },
           ...(data.rt_cols ? [
             { label:'DMS',      value:Nf(Object.values(grandTotals.colVals).reduce((s,v)=>s+(v[2]||0),0)), color:'#7C3AED' },
             { label:'Call Out', value:Nf(Object.values(grandTotals.colVals).reduce((s,v)=>s+(v[3]||0),0)), color:'#0891B2' },
@@ -5367,10 +5958,10 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
 
     /* ── Pivot table ── */
     !unsupported && !awaitingPipeline && !noData &&
-    ce('div', { style:{ overflowX:'auto', borderRadius:12, border:'1px solid #E2E8F0' } },
+    ce('div', { style:{ overflow:'auto', maxHeight:'calc(100vh - 190px)', borderRadius:12, border:'1px solid #E2E8F0' } },
       ce('table', { style:{ width:'100%', borderCollapse:'collapse', fontSize:13 } },
 
-        ce('thead', null, (() => {
+        ce('thead', { ref: theadRef }, (() => {
           // Header layout:
           // showOuterRow: col1 groups (hasC2) OR col values spanning metrics (!hasC2+multiMetric)
           // showMidRow:   col2 values each spanning metrics (hasC2 + multiMetric only)
@@ -5386,6 +5977,24 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
           const botTxt  = '#fff';
 
           // Label cell helper for row-dim columns
+          // Ascending / descending buttons on every column header
+          const sortBtns = (by, m) => ce('span', { style:{ marginLeft:6, whiteSpace:'nowrap', userSelect:'none' } },
+            ['asc', 'desc'].map(dir => ce('span', { key:dir,
+              title: dir === 'asc' ? 'Sort ascending' : 'Sort descending',
+              onClick: e => { e.stopPropagation(); setSortBy(by); setSortM(m || null); setSortDir(dir); },
+              style:{ cursor:'pointer', padding:'0 2px', fontSize:10,
+                      color: sortBy === by && sortDir === dir && (!m || sm === m) ? '#FDE047' : 'rgba(255,255,255,0.45)' }
+            }, dir === 'asc' ? '\u25B2' : '\u25BC')));
+
+          // "%" switch on number columns: show the column as % of subtotal
+          const pctBtn = (ck, m) => m === 'retpct' ? null : ce('span', {
+            title: isPct(ck, m) ? 'Show numbers' : 'Show as % of subtotal',
+            onClick: e => { e.stopPropagation(); togglePct(ck, m); },
+            style:{ cursor:'pointer', marginLeft:4, padding:'0 4px', fontSize:10, fontWeight:700, borderRadius:4,
+                    border:'1px solid rgba(255,255,255,0.4)',
+                    color: isPct(ck, m) ? '#1a3a5c' : 'rgba(255,255,255,0.8)',
+                    background: isPct(ck, m) ? '#FDE047' : 'transparent' } }, '%');
+
           const rowLabelTh = (dim, i, bg, txt, small) =>
             ce('th', { key:`rl_${dim}`,
               style:{ padding: small?'6px 16px':'10px 16px', textAlign:'left', fontWeight:700,
@@ -5395,9 +6004,8 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                       background: bg,
                       minWidth: i===0 ? 140 : 110,
                       borderRight: i===rowDims.length-1 ? `1px solid ${txt==='#fff'?'rgba(255,255,255,0.15)':'rgba(0,0,0,0.1)'}` : 'none',
-                      cursor: i===0 ? 'pointer' : 'default', userSelect:'none' },
-              onClick: i===0 ? ()=>{ setSortBy('__label__'); setSortDir(d=>d==='asc'?'desc':'asc'); } : undefined
-            }, (DIMS.find(d=>d.key===dim)?.label||dim) + (i===0&&sortBy==='__label__'?(sortDir==='asc'?' ↑':' ↓'):''));
+                      userSelect:'none' }
+            }, (DIMS.find(d=>d.key===dim)?.label||dim), txt === '#fff' ? sortBtns(i === 0 ? '__label__' : '__label2__', null) : null);
 
           const rows = [];
 
@@ -5475,44 +6083,36 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
               if (multiMetric) {
                 return metrics.map((m, mi) =>
                   ce('th', { key:`bot_${ck}_${m}`,
-                    title: 'Click to sort (click again to flip Asc / Desc)',
                     style:{ padding:'6px 10px', textAlign:'right', fontWeight:500, whiteSpace:'nowrap',
-                            fontSize:11, color:botTxt, background:botBg, cursor:'pointer', userSelect:'none',
+                            fontSize:11, color:botTxt, background:botBg,
                             borderLeft: mi===0&&groupBorder ? '1px solid rgba(255,255,255,0.15)'
-                                       : mi===0&&ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none' },
-                    onClick: () => clickSort(ck, m)
-                  }, (METRICS.find(x=>x.key===m)?.label||m) + sortArrow(ck, m))
+                                       : mi===0&&ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none' }
+                  }, METRICS.find(x=>x.key===m)?.label||m, sortBtns(ck, m), pctBtn(ck, m))
                 );
               }
               // single metric
               const colLabel = hasC2
                 ? ck.slice(ck.indexOf(COL_SEP) + 1)
                 : ck;
-              const sortable = !hasC2;
               return [ce('th', { key:`bot_${ck}`,
                 style:{ padding: numHdrRows>1?'6px 12px':'10px 12px', textAlign:'right',
                         fontWeight:600, whiteSpace:'nowrap', minWidth: multiMetric?68:80,
                         color:botTxt, background:botBg,
                         borderLeft: groupBorder ? '1px solid rgba(255,255,255,0.15)'
                                    : ci>0&&!hasC2 ? '1px solid rgba(255,255,255,0.1)' : 'none',
-                        cursor: 'pointer', userSelect:'none' },
-                title: 'Click to sort (click again to flip Asc / Desc)',
-                onClick: ()=>clickSort(ck, metrics[0])
-              }, colLabel + sortArrow(ck, metrics[0]))];
+                        userSelect:'none' }
+              }, colLabel, sortBtns(ck, metrics[0]), pctBtn(ck, metrics[0]))];
             }),
 
             // TOTAL header(s)
             ...metrics.map((m, mi) => {
-              const sortable = !multiMetric;
               return ce('th', { key:`btot_${m}`,
                 style:{ padding: numHdrRows>1?'6px 10px':'10px 12px', textAlign:'right',
                         fontWeight:700, whiteSpace:'nowrap',
                         fontSize: multiMetric?11:13, color:botTxt, background:botBg,
                         borderLeft: mi===0 ? '2px solid rgba(255,255,255,0.3)' : 'none',
-                        cursor: 'pointer', userSelect:'none' },
-                title: 'Click to sort by total (click again to flip Asc / Desc)',
-                onClick: ()=>clickSort('__total__', m)
-              }, (multiMetric ? (METRICS.find(x=>x.key===m)?.label||m) : 'TOTAL') + sortArrow('__total__', m));
+                        userSelect:'none' }
+              }, multiMetric ? (METRICS.find(x=>x.key===m)?.label||m) : 'TOTAL', sortBtns('__total__', m), pctBtn('__total__', m));
             })
           ));
 
@@ -5571,7 +6171,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                             fontWeight: hasR2 ? 700 : 400,
                             borderLeft: mi===0&&(groupBorder||(multiMetric&&ci>0))
                               ? `1px solid ${grpSep}` : 'none' }
-                  }, fmtV(entry.sub.get(ck), m))
+                  }, cellV(entry.sub.get(ck), m, ck, grandTotals.colVals[ck]))
                 );
               }),
               // Row totals
@@ -5580,7 +6180,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                   style:{ padding:'8px 12px', textAlign:'right', fontWeight:700,
                           background: grpBg, color: grpTxt,
                           borderLeft: mi===0 ? `2px solid ${grpSep}` : 'none' }
-                }, fmtTotal(entry.sub, m))
+                }, cellTot(entry.sub, m, null))
               )
             ));
 
@@ -5611,7 +6211,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                         style:{ padding:'7px 12px', textAlign:'right', color:cTxt,
                                 fontSize:12,
                                 borderLeft: mi===0&&(groupBorder||(multiMetric&&colI>0)) ? `1px solid ${pal.sep}` : 'none' }
-                      }, fmtV(cMap.get(ck), m))
+                      }, cellV(cMap.get(ck), m, ck, entry.sub.get(ck)))
                     );
                   }),
                   // Row totals
@@ -5619,7 +6219,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                     ce('td', { key:`tot_${m}`,
                       style:{ padding:'7px 12px', textAlign:'right', fontWeight:700, color:cTxt,
                               fontSize:12, borderLeft: mi===0 ? `2px solid ${pal.sep}` : 'none' }
-                    }, fmtTotal(cMap, m))
+                    }, cellTot(cMap, m, entry.sub))
                   )
                 ));
               }
@@ -5644,7 +6244,7 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                 ce('td', { key:`gt_${ck}_${m}`,
                   style:{ padding:'10px 12px', textAlign:'right', color:'#fff', background:'#1E3A8A',
                           borderLeft: mi===0&&(groupBorder||(multiMetric&&ci>0)) ? '1px solid rgba(255,255,255,0.2)' : 'none' }
-                }, fmtV(cv, m))
+                }, isPct(ck, m) ? (getMetricVal(cv, m) > 0 ? '100.0%' : '—') : fmtV(cv, m))
               );
             }),
             ...metrics.map((m, mi) => {
@@ -5655,10 +6255,10 @@ const PivotTab = React.memo(function PivotTab({ data, filters, months, RT, pmMap
                 const t = m === 'leads' ? grandTotals.gl
                         : m === 'ret'   ? grandTotals.gr
                         : Object.values(grandTotals.colVals).reduce((s, v) => s + getMetricVal(v, m), 0);
-                display = t > 0 ? t.toLocaleString() : '—';
+                display = t > 0 ? (isPct('__total__', m) ? '100.0%' : t.toLocaleString()) : '—';
               }
               return ce('td', { key:`gt_tot_${m}`,
-                style:{ padding:'10px 12px', textAlign:'right',
+                style:{ padding:'10px 12px', textAlign:'right', background:'#1E3A8A',
                         borderLeft: mi===0 ? '2px solid rgba(255,255,255,0.3)' : 'none', color:'#fff' }
               }, display);
             })
