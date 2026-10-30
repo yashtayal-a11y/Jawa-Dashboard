@@ -266,3 +266,39 @@ def build_payload(leads, retail_map, built_iso):
     P['ram_meta'] = {'total': ram_total, 'valid': ram_valid, 'no_rd': ram_no_rd, 'no_cd': ram_no_cd, 'neg': ram_neg}
     P['snf'] = [[*map(int, k.split('|')), v] for k, v in snf.items()]
     return P
+
+
+def build_daily(leads, retail_map, built_iso, n_months=4):
+    """Day-level detail for the latest `n_months` lead months (Day on Day and Lead -> Retail TAT tabs): leads by creation day
+    and retails by creation day / attribution day, with Model / Source / Lead Type / State / City (and purchased model).
+    Columnar, same layout as the TVS daily file. A day ending in 00 means "no day recorded" for that month."""
+    months = sorted({_ym(L['lm']) for L in leads if L.get('lm') and _ym(L['lm'])})[-n_months:]
+    mset = set(months)
+    idx = {k: ({}, []) for k in ('mdl', 'src', 'lt', 'st', 'city')}
+
+    def ix(k, v):
+        d, a = idx[k]
+        if v not in d: d[v] = len(a); a.append(v)
+        return d[v]
+
+    Lg, Rg = {}, {}
+    for L in leads:
+        lid, lm = L['lid'], L['lm']
+        if not lm or not lid: continue
+        mdl = ix('mdl', L['mdl'] or 'Unknown'); src = ix('src', L['src'] or 'Unknown'); lt = ix('lt', L['lt'] or 'Unknown')
+        st = ix('st', (L['st'] or '').strip().title() or 'Unknown'); ci = ix('city', normalize_city(L['city']))
+        cd = day_key(L['cd'], lm)
+        if cd // 100 in mset:
+            k = (cd, mdl, src, lt, st, ci); Lg[k] = Lg.get(k, 0) + 1
+        rt = retail_map.get(lid)
+        if rt is None: continue
+        ud = day_key(rt.get('ad'), rt.get('rm') or lm)
+        if cd // 100 not in mset and ud // 100 not in mset: continue
+        ru = rt['rtype'].upper()
+        pm = ix('mdl', (rt.get('pm') or '').strip() or 'Unknown')
+        k = (cd, ud, mdl, src, lt, st, ci, pm, 0 if 'DMS' in ru else 1 if 'CALL' in ru else 2)
+        Rg[k] = Rg.get(k, 0) + 1
+    Lk, Rk = sorted(Lg), sorted(Rg)
+    return {'t': built_iso, 'months': months, 'maps': {k: idx[k][1] for k in idx},
+            'L': {n: [r[i] for r in Lk] for i, n in enumerate(['d', 'mi', 'si', 'lt', 'st', 'ci'])} | {'n': [Lg[r] for r in Lk]},
+            'R': {n: [r[i] for r in Rk] for i, n in enumerate(['cd', 'ud', 'mi', 'si', 'lt', 'st', 'ci', 'pm', 'rt'])} | {'n': [Rg[r] for r in Rk]}}

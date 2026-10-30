@@ -3633,10 +3633,12 @@ const ModelPerfTab = React.memo(function ModelPerfTab({ data, filters, months, R
    day = YYYYMMDD ; YYYYMM00 = "no day recorded" for that month (kept so month totals always reconcile).
    State / City / Purchased-model filters do not exist in these tables.
    â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
-let _dailyPromise = null;
+let _dailyPromise = null, _dailyKey = null;
 function loadDailyDetail() {
+  const _dk = window.__jawaUniq ? 'jawa_daily_unique' : 'jawa_daily';
+  if (_dailyKey !== _dk) { _dailyKey = _dk; _dailyPromise = null; }
   if (!_dailyPromise) {
-    _dailyPromise = fetch('./data/jawa_daily.json.gz', { cache: 'no-store' }).then(async resp => {
+    _dailyPromise = fetch('./data/' + _dk + '.json.gz?b=__BUILD_ID__', { cache: 'no-store' }).then(async resp => {
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const reader = resp.body.pipeThrough(new DecompressionStream('gzip')).getReader();
       const chunks = [];
@@ -3695,7 +3697,7 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
     let live = true;
     loadDailyDetail().then(d => { if (live) setDaily(d && d.t === data.t ? d : false); });
     return () => { live = false; };
-  }, [data.t]);
+  }, [data.t, data.uq]);
   const dx = useMemo(() => (daily ? { ...daily, cityName: daily.maps.city.map(c => canonicalCity(c)) } : null), [daily]);
 
   const view = useMemo(() => {
@@ -4035,6 +4037,294 @@ const DailyTab = React.memo(function DailyTab({ data, filters, months, RT, leads
   );
 });
 
+/* ════════════════════════════════════════════════════════════════════
+   LEAD → RETAIL TAT TAB  (admins only, lead-creation basis)
+   Summary : one row per lead month. Leads, retailed, open, conversion; turnaround (median / average / P90 / within 7 days);
+             retails by retail month (same month, next month, ...).
+             Retail months come from data.pmx (lead month x retail month, every filter). Turnaround days come from the day-level
+             detail file (latest 4 lead months only: older months have no lead / retail dates).
+   Matrix  : lead day (rows) x retail day (columns) for one month, from the day-level detail file.
+   ════════════════════════════════════════════════════════════════════ */
+const TatTab = React.memo(function TatTab({ data, filters, months, RT }) {
+  const { maps } = data;
+  const has = s => !!(s && s.size);
+  const CAP = 11;                                   // retail-month columns: M+0 ... M+11 (M+11 also holds anything later)
+  const ymOf  = lbl => { const x = /([A-Za-z]+)'(\d+)/.exec(lbl || ''); return x ? (2000 + +x[2]) * 100 + MONTHS.indexOf(x[1]) + 1 : 0; };
+  const ordOf = lbl => { const x = /([A-Za-z]+)'(\d+)/.exec(lbl || ''); return x ? (2000 + +x[2]) * 12 + MONTHS.indexOf(x[1]) : -1; };
+  const dser  = d => Date.UTC(Math.floor(d / 10000), Math.floor(d / 100) % 100 - 1, d % 100) / 864e5;
+
+  const [daily, setDaily] = useState(null);
+  useEffect(() => {
+    let live = true;
+    loadDailyDetail().then(d => { if (live) setDaily(d && d.t === data.t ? d : false); });
+    return () => { live = false; };
+  }, [data.t, data.uq]);
+  const dx = useMemo(() => (daily ? { ...daily, cityName: daily.maps.city.map(c => canonicalCity(c)) } : null), [daily]);
+
+  const opts = useMemo(() => (months || []).filter(m => m && m !== '\x00'), [months]);
+  const [sel, setSel] = useState(opts[0] || '');
+  useEffect(() => { if (opts.length && !opts.includes(sel)) setSel(opts[0]); }, [opts]);
+
+  const hasPmx = !!(data.pmx && data.pmx.length);
+  const cityOn = has(filters.cities);
+
+  // ── Summary rows ──────────────────────────────────────────────────
+  const summary = useMemo(() => {
+    if (!opts.length || !hasPmx) return null;
+    const mset = new Set(opts);
+    const lmOk = maps.lm.map(l => mset.has(l));
+    const okS  = maps.src.map(n => !has(filters.sources)   || filters.sources.has(n));
+    const okM  = maps.mdl.map(n => !has(filters.models)    || filters.models.has(n));
+    const okT  = maps.lt.map(n => !has(filters.leadTypes)  || filters.leadTypes.has(n));
+    const okSt = maps.st.map(n => !has(filters.states)     || filters.states.has(n));
+    const okC  = (maps.city || []).map(n => !cityOn || filters.cities.has(n));
+    const pmSel = has(filters.purchasedModels) ? resolvePmIdx(filters.purchasedModels, maps) : null;
+
+    // leads by lead month (every filter except Purch. Model; with a City filter only Model / Source / State / City apply)
+    const L = new Map();
+    if (!cityOn) {
+      for (const r of (data.univ || [])) {                          // [mi, si, sti, tti, li, L, ...]
+        if (!lmOk[r[4]] || !okM[r[0]] || !okS[r[1]] || !okSt[r[2]] || !okT[r[3]]) continue;
+        L.set(r[4], (L.get(r[4]) || 0) + r[5]);
+      }
+    } else {
+      for (const r of (data.cxsm || [])) {                          // [cti, si, mi, li, L, ...]
+        if (!lmOk[r[3]] || !okC[r[0]] || !okS[r[1]] || !okM[r[2]]) continue;
+        if (has(filters.states)) { const s = (maps.city_state || [])[r[0]]; if (s == null || !okSt[s]) continue; }
+        L.set(r[3], (L.get(r[3]) || 0) + r[4]);
+      }
+    }
+
+    // retails by lead month and retail month offset (pmx v2: [pmi, mi, si, sti, tti, cti, dli, li, uli, R, Rd, Rc])
+    const o = (data.pmx_v || 1) >= 2 ? 1 : 0, ri = 8 + o + (RT === 'dms' ? 1 : RT === 'co' ? 2 : 0);
+    const K = new Map();                                            // li -> array(CAP + 1)
+    let kmax = 0;
+    for (const x of data.pmx) {
+      const li = x[6 + o];
+      if (!lmOk[li]) continue;
+      if (pmSel ? !pmSel.has(x[0]) : !okM[x[1]]) continue;           // a Purch. Model selection replaces the enquired-Model filter for retails
+      if (!okS[x[2]] || !okSt[x[3]] || !okT[x[4]] || !okC[x[5]]) continue;
+      const v = x[ri]; if (!v) continue;
+      const k = Math.min(CAP, Math.max(0, ordOf(maps.lm[x[7 + o]]) - ordOf(maps.lm[li])));
+      let a = K.get(li); if (!a) { a = new Array(CAP + 1).fill(0); K.set(li, a); }
+      a[k] += v; if (k > kmax) kmax = k;
+    }
+
+    // turnaround days (exact, day-level detail file; latest 4 lead months)
+    const ymSel = new Set(opts.map(ymOf));
+    const ST = new Map();                                           // ym -> { n, sum, hist, noDate }
+    if (dx) {
+      const P = dailyPreds(dx, filters, maps), B = dx.R;
+      for (let i = 0; i < B.n.length; i++) {
+        const cym = Math.floor(B.cd[i] / 100);
+        if (!ymSel.has(cym) || !dx.months.includes(cym) || B.rt[i] === 2) continue;
+        if (B.rt[i] === 0 ? RT === 'co' : RT === 'dms') continue;
+        if (!((P.pmSel || P.okM[B.mi[i]]) && P.okS[B.si[i]] && P.okT[B.lt[i]] && P.okSt[B.st[i]] && P.okC[B.ci[i]])) continue;
+        if (P.pmSel && !P.pmSel.has(B.pm[i])) continue;
+        let e = ST.get(cym); if (!e) { e = { n: 0, sum: 0, w7: 0, hist: new Map(), noDate: 0 }; ST.set(cym, e); }
+        if (B.cd[i] % 100 === 0 || B.ud[i] % 100 === 0) { e.noDate += B.n[i]; continue; }
+        const t = Math.round(dser(B.ud[i]) - dser(B.cd[i]));
+        if (t < 0) { e.noDate += B.n[i]; continue; }
+        e.n += B.n[i]; e.sum += t * B.n[i]; if (t <= 7) e.w7 += B.n[i];
+        e.hist.set(t, (e.hist.get(t) || 0) + B.n[i]);
+      }
+    }
+    const finish = e => {
+      if (!e || !e.n) return null;
+      const keys = [...e.hist.keys()].sort((a, b) => a - b);
+      const at = q => { let c = 0; for (const k of keys) { c += e.hist.get(k); if (c >= q * e.n) return k; } return keys[keys.length - 1]; };
+      return { n: e.n, avg: e.sum / e.n, med: at(0.5), p90: at(0.9), w7: e.w7 / e.n * 100, noDate: e.noDate };
+    };
+
+    const rows = [];
+    opts.forEach(m => {
+      const li = maps.lm.indexOf(m);
+      const leads = L.get(li) || 0, ks = K.get(li) || new Array(CAP + 1).fill(0);
+      const ret = ks.reduce((s, v) => s + v, 0);
+      if (!leads && !ret) return;
+      rows.push({ m, ym: ymOf(m), leads, ret, open: Math.max(0, leads - ret), conv: leads > 0 ? ret / leads * 100 : 0, ks, st: finish(ST.get(ymOf(m))) });
+    });
+    const agg = new Map();                                          // overall turnaround across the months that have day detail
+    for (const e of ST.values()) {
+      let g = agg.get('all'); if (!g) { g = { n: 0, sum: 0, w7: 0, hist: new Map(), noDate: 0 }; agg.set('all', g); }
+      g.n += e.n; g.sum += e.sum; g.w7 += e.w7; g.noDate += e.noDate;
+      for (const [t, c] of e.hist) g.hist.set(t, (g.hist.get(t) || 0) + c);
+    }
+    const tl = rows.reduce((s, r) => s + r.leads, 0), tr = rows.reduce((s, r) => s + r.ret, 0);
+    return { rows, kmax, total: { leads: tl, ret: tr, conv: tl > 0 ? tr / tl * 100 : 0 }, overall: finish(agg.get('all')), tatMonths: [...ST.keys()].length };
+  }, [data, filters, opts, RT, dx, hasPmx, cityOn, maps]);
+
+  // ── Day-by-day matrix: lead day (rows) x retail day (columns) for one month ─────
+  const mat = useMemo(() => {
+    const ym = ymOf(sel);
+    if (!sel || !dx || !ym) return null;
+    if (!dx.months.includes(ym)) return { na: true };
+    const dim = new Date(Math.floor(ym / 100), ym % 100, 0).getDate();
+    const P = dailyPreds(dx, filters, maps);
+    const rows = Array.from({ length: dim + 1 }, () => ({ L: 0, cells: new Array(dim).fill(0), later: 0, nod: 0 }));   // row 0 = no lead day recorded
+    const A = dx.L, B = dx.R;
+    for (let i = 0; i < A.n.length; i++) {
+      if (Math.floor(A.d[i] / 100) !== ym) continue;
+      if (!(P.okM[A.mi[i]] && P.okS[A.si[i]] && P.okT[A.lt[i]] && P.okSt[A.st[i]] && P.okC[A.ci[i]])) continue;
+      const d = A.d[i] % 100; rows[d > dim ? 0 : d].L += A.n[i];
+    }
+    for (let i = 0; i < B.n.length; i++) {
+      if (Math.floor(B.cd[i] / 100) !== ym || B.rt[i] === 2) continue;
+      if (B.rt[i] === 0 ? RT === 'co' : RT === 'dms') continue;
+      if (!((P.pmSel || P.okM[B.mi[i]]) && P.okS[B.si[i]] && P.okT[B.lt[i]] && P.okSt[B.st[i]] && P.okC[B.ci[i]])) continue;
+      if (P.pmSel && !P.pmSel.has(B.pm[i])) continue;
+      const d = B.cd[i] % 100, r = rows[d > dim ? 0 : d], u = B.ud[i], uym = Math.floor(u / 100);
+      if (u % 100 === 0 || uym < ym) r.nod += B.n[i];
+      else if (uym === ym) r.cells[Math.min(dim, u % 100) - 1] += B.n[i];
+      else r.later += B.n[i];
+    }
+    let max = 0;
+    const colTot = new Array(dim).fill(0); let tL = 0, tLater = 0, tNod = 0;
+    rows.forEach(r => { r.ret = r.cells.reduce((s, v) => s + v, 0) + r.later + r.nod; r.open = Math.max(0, r.L - r.ret);
+      r.cells.forEach((v, c) => { if (v > max) max = v; colTot[c] += v; }); tL += r.L; tLater += r.later; tNod += r.nod; });
+    const used = rows.filter(r => r.L || r.ret);
+    return { dim, ym, rows, max, colTot, tL, tLater, tNod, tRet: rows.reduce((s, r) => s + r.ret, 0), showNoDay: !!(rows[0].L || rows[0].ret), used: used.length };
+  }, [sel, dx, filters, RT, maps]);
+
+  const exportData = () => {
+    if (!summary) return;
+    const kl = k => (k === 0 ? 'Same month' : k === 1 ? 'Next month' : '+' + k + (k === CAP ? ' months or later' : ' months'));
+    const a1 = [['Lead month', 'Leads', 'Retailed', 'Open', 'Conv %', 'Retails with a date', 'Median days', 'Average days', 'P90 days', 'Within 7 days %',
+      ...Array.from({ length: summary.kmax + 1 }, (_, k) => 'Retail ' + kl(k))]];
+    summary.rows.forEach(r => a1.push([r.m, r.leads, r.ret, r.open, +r.conv.toFixed(2), r.st ? r.st.n : '', r.st ? r.st.med : '', r.st ? +r.st.avg.toFixed(2) : '',
+      r.st ? r.st.p90 : '', r.st ? +r.st.w7.toFixed(1) : '', ...r.ks.slice(0, summary.kmax + 1)]));
+    const sheets = { 'Lead to retail TAT': a1 };
+    if (mat && !mat.na) {
+      const hdr = ['Lead day', 'Leads', 'Retailed', 'Retailed within month', '% within month', ...Array.from({ length: mat.dim }, (_, i) => 'Retail day ' + (i + 1)), 'Retailed later months', '% later months', 'No retail date'];
+      const a2 = [hdr];
+      mat.rows.forEach((r, d) => { if (!(r.L || r.ret)) return; a2.push([d === 0 ? 'No day recorded' : d, r.L, r.ret, r.ret - r.later - r.nod, r.L > 0 ? +((r.ret - r.later - r.nod) / r.L * 100).toFixed(2) : '', ...r.cells, r.later, r.L > 0 ? +(r.later / r.L * 100).toFixed(2) : '', r.nod]); });
+      a2.push(['Total', mat.tL, mat.tRet, mat.tRet - mat.tLater - mat.tNod, mat.tL > 0 ? +((mat.tRet - mat.tLater - mat.tNod) / mat.tL * 100).toFixed(2) : '', ...mat.colTot, mat.tLater, mat.tL > 0 ? +(mat.tLater / mat.tL * 100).toFixed(2) : '', mat.tNod]);
+      sheets['Matrix ' + sel] = a2;
+    }
+    exportXlsx(sheets, 'TVS_Lead_TAT');
+  };
+
+  if (!hasPmx) return ce('div', { className: 'fs-14', style: { textAlign: 'center', padding: 60, color: '#94A3B8' } }, 'Lead-to-retail data will appear after the next pipeline run.');
+  if (!opts.length || !summary) return ce('div', { className: 'fs-14', style: { textAlign: 'center', padding: 60, color: '#94A3B8' } },
+    'No month selected — pick at least one month in the Month filter above.');
+
+  // styles
+  const FS = 'var(--tvs-font-scale)';
+  const th = (extra) => ({ background: '#001F5B', color: '#fff', padding: '7px 8px', fontWeight: 700, fontSize: 'calc(10px * ' + FS + ')', textTransform: 'uppercase', letterSpacing: '0.03em',
+    border: '1px solid rgba(255,255,255,.15)', textAlign: 'center', whiteSpace: 'nowrap', ...extra });
+  const td = (extra) => ({ padding: '6px 8px', border: '1px solid #E2E8F0', textAlign: 'center', fontFamily: "'DM Mono',monospace", fontSize: 'calc(12px * ' + FS + ')', ...extra });
+  const kl = k => (k === 0 ? 'Same month' : k === 1 ? 'Next month' : '+' + k + (k === CAP ? ' mo or later' : ' months'));
+  const dash = '—', dAvg = v => (v == null ? dash : v.toFixed(1) + ' d'), dInt = v => (v == null ? dash : v + ' d');
+  const kpi = (label, val, color) => ce('div', { style: { flex: '1 1 130px', padding: '10px 14px', background: '#F8FAFC', borderRadius: 10, border: '1px solid #E2E8F0' } },
+    ce('div', { style: { fontSize: 'calc(10px * ' + FS + ')', fontWeight: 700, color: '#64748B', textTransform: 'uppercase', letterSpacing: '0.04em' } }, label),
+    ce('div', { style: { fontSize: 'calc(20px * ' + FS + ')', fontWeight: 700, color: color || '#0f172a', fontFamily: "'DM Mono',monospace", marginTop: 2 } }, val));
+  const ov = summary.overall;
+
+  const kCols = Array.from({ length: summary.kmax + 1 }, (_, k) => k);
+  const summaryTable = ce('div', { style: { overflowX: 'auto' } },
+    ce('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+      ce('thead', null,
+        ce('tr', null,
+          ce('th', { rowSpan: 2, style: th({ textAlign: 'left', position: 'sticky', left: 0, zIndex: 3, minWidth: 90 }) }, 'Lead month'),
+          ce('th', { rowSpan: 2, style: th() }, 'Leads'), ce('th', { rowSpan: 2, style: th() }, 'Retailed'), ce('th', { rowSpan: 2, style: th() }, 'Open'),
+          ce('th', { rowSpan: 2, style: th() }, 'Conv %'),
+          ce('th', { colSpan: 4, style: th({ background: '#B01229' }) }, 'Days from lead to retail'),
+          ce('th', { colSpan: kCols.length, style: th({ background: '#0F766E' }) }, 'Retails by retail month (count, % of leads)')),
+        ce('tr', null,
+          ...['Median', 'Average', '90th pct', 'Within 7 d'].map(t => ce('th', { key: t, style: th({ background: '#B01229' }) }, t)),
+          ...kCols.map(k => ce('th', { key: k, style: th({ background: '#0F766E' }) }, kl(k))))),
+      ce('tbody', null,
+        ...summary.rows.map((r, i) => ce('tr', { key: r.m, style: { background: i % 2 ? '#F8FAFC' : '#fff' } },
+          ce('td', { style: td({ textAlign: 'left', fontWeight: 700, position: 'sticky', left: 0, background: i % 2 ? '#F8FAFC' : '#fff', zIndex: 2 }) }, r.m),
+          ce('td', { style: td() }, Nf(r.leads)), ce('td', { style: td({ fontWeight: 700 }) }, Nf(r.ret)), ce('td', { style: td({ color: '#64748B' }) }, r.open ? Nf(r.open) : dash),
+          ce('td', { style: td({ fontWeight: 700, color: '#B01229' }) }, r.leads > 0 ? r.conv.toFixed(1) + '%' : dash),
+          ce('td', { style: td({ color: r.st ? '#0f172a' : '#CBD5E1' }), title: r.st ? r.st.n + ' retails with a retail date' + (r.st.noDate ? ' (' + r.st.noDate + ' without one are left out)' : '') : 'No day-level dates for this month' }, r.st ? dInt(r.st.med) : dash),
+          ce('td', { style: td({ color: r.st ? '#0f172a' : '#CBD5E1' }) }, r.st ? dAvg(r.st.avg) : dash),
+          ce('td', { style: td({ color: r.st ? '#0f172a' : '#CBD5E1' }) }, r.st ? dInt(r.st.p90) : dash),
+          ce('td', { style: td({ color: r.st ? '#0f172a' : '#CBD5E1' }) }, r.st ? r.st.w7.toFixed(0) + '%' : dash),
+          ...kCols.map(k => { const v = r.ks[k]; const a = r.leads > 0 ? Math.min(1, v / r.leads / 0.5) : 0;
+            return ce('td', { key: k, style: td({ background: v ? 'rgba(15,118,110,' + (0.06 + a * 0.5).toFixed(2) + ')' : undefined }) },
+              v ? ce('div', null, ce('div', { style: { fontWeight: 700 } }, Nf(v)), ce('div', { style: { fontSize: 'calc(10px * ' + FS + ')', color: '#475569' } }, r.leads > 0 ? (v / r.leads * 100).toFixed(1) + '%' : '')) : dash); }))),
+        ce('tr', { style: { background: '#E2E8F0', fontWeight: 700 } },
+          ce('td', { style: td({ textAlign: 'left', fontWeight: 700, position: 'sticky', left: 0, background: '#E2E8F0', zIndex: 2 }) }, '∑ Total'),
+          ce('td', { style: td({ fontWeight: 700 }) }, Nf(summary.total.leads)), ce('td', { style: td({ fontWeight: 700 }) }, Nf(summary.total.ret)),
+          ce('td', { style: td({ fontWeight: 700 }) }, Nf(Math.max(0, summary.total.leads - summary.total.ret))),
+          ce('td', { style: td({ fontWeight: 700, color: '#B01229' }) }, summary.total.conv.toFixed(1) + '%'),
+          ce('td', { style: td({ fontWeight: 700 }) }, ov ? dInt(ov.med) : dash), ce('td', { style: td({ fontWeight: 700 }) }, ov ? dAvg(ov.avg) : dash),
+          ce('td', { style: td({ fontWeight: 700 }) }, ov ? dInt(ov.p90) : dash), ce('td', { style: td({ fontWeight: 700 }) }, ov ? ov.w7.toFixed(0) + '%' : dash),
+          ...kCols.map(k => { const v = summary.rows.reduce((s, r) => s + r.ks[k], 0);
+            return ce('td', { key: k, style: td({ fontWeight: 700 }) }, v ? ce('div', null, ce('div', null, Nf(v)), ce('div', { style: { fontSize: 'calc(10px * ' + FS + ')', color: '#475569' } }, summary.total.leads > 0 ? (v / summary.total.leads * 100).toFixed(1) + '%' : '')) : dash); })))));
+
+  // matrix
+  let matrixEl;
+  if (!mat) matrixEl = ce('div', { className: 'fs-12', style: { padding: 24, textAlign: 'center', color: '#94A3B8' } }, daily === null ? 'Loading day-level detail…' : 'Day-level detail is not available.');
+  else if (mat.na) matrixEl = ce('div', { className: 'fs-12', style: { padding: 24, textAlign: 'center', color: '#64748B' } },
+    'Day-level lead and retail dates exist only for the latest 4 lead months (' + ((dx && dx.months) || []).map(ym => MONTHS[ym % 100 - 1] + "'" + String(Math.floor(ym / 100) % 100).padStart(2, '0')).join(', ') + '). Pick one of those months.');
+  else {
+    const heat = v => (v ? 'rgba(15,118,110,' + (0.10 + 0.6 * Math.sqrt(v / mat.max)).toFixed(2) + ')' : undefined);
+    const cw = { minWidth: 34, padding: '4px 3px' };
+    let lastDay = 0;
+    mat.rows.forEach((r, d) => { if (d > 0 && (r.L || r.ret)) lastDay = d; });
+    const showRows = mat.rows.map((r, d) => ({ r, d })).filter(x => (x.d === 0 ? mat.showNoDay : x.d <= lastDay));
+    // The first five columns stay put while the day grid scrolls sideways.
+    const FW = [78, 72, 78, 92, 76], FL = FW.map((w, i) => FW.slice(0, i).reduce((s, x) => s + x, 0));
+    const fz = (i, bg, extra) => ({ position: 'sticky', left: FL[i], minWidth: FW[i], width: FW[i], maxWidth: FW[i], boxSizing: 'border-box', background: bg, zIndex: 2,
+      borderRight: i === 4 ? '2px solid #64748B' : undefined, ...extra });
+    const hd = (extra) => th({ position: 'sticky', top: 0, zIndex: 4, ...extra });
+    const fh = (i, extra) => th({ position: 'sticky', top: 0, left: FL[i], zIndex: 6, minWidth: FW[i], width: FW[i], maxWidth: FW[i], boxSizing: 'border-box',
+      borderRight: i === 4 ? '2px solid #64748B' : undefined, ...extra });
+    const pc = (x, den) => (den > 0 && x > 0 ? (x / den * 100).toFixed(1) + '%' : dash);
+    const TOT = '#E2E8F0', tb = { position: 'sticky', bottom: 0, zIndex: 3, fontWeight: 700, background: TOT };
+    matrixEl = ce('div', { style: { overflow: 'auto', maxHeight: 'calc(100vh - 190px)', borderRadius: 10, border: '1px solid #E2E8F0' } },
+      ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%' } },
+        ce('thead', null, ce('tr', null,
+          ce('th', { style: fh(0, { textAlign: 'left' }) }, 'Lead day'), ce('th', { style: fh(1) }, 'Leads'), ce('th', { style: fh(2) }, 'Retailed'),
+          ce('th', { style: fh(3) }, 'Within month'), ce('th', { style: fh(4) }, '% within'),
+          ...Array.from({ length: mat.dim }, (_, c) => ce('th', { key: c, style: hd({ background: '#0F766E', minWidth: 34, padding: '7px 3px' }) }, String(c + 1))),
+          ce('th', { style: hd({ background: '#0F766E' }) }, 'Later months'), ce('th', { style: hd({ background: '#0F766E' }) }, '% later'),
+          ce('th', { style: hd({ background: '#475569' }) }, 'No retail date'))),
+        ce('tbody', null,
+          ...showRows.map(({ r, d }) => { const w = r.ret - r.later - r.nod; return ce('tr', { key: d },
+            ce('td', { style: td(fz(0, '#F1F5F9', { textAlign: 'left', fontWeight: 700 })) }, d === 0 ? 'No day' : d + ' ' + MONTHS[mat.ym % 100 - 1]),
+            ce('td', { style: td(fz(1, '#fff', { fontWeight: 700 })) }, r.L ? Nf(r.L) : dash), ce('td', { style: td(fz(2, '#fff', { fontWeight: 700 })) }, r.ret ? Nf(r.ret) : dash),
+            ce('td', { style: td(fz(3, '#fff', { fontWeight: 700 })) }, w ? Nf(w) : dash), ce('td', { style: td(fz(4, '#fff', { fontWeight: 700, color: '#B01229' })) }, pc(w, r.L)),
+            ...r.cells.map((v, c) => ce('td', { key: c, style: td({ ...cw, background: v ? heat(v) : (c + 1 === d ? '#CBD5E1' : undefined), color: v ? '#0f172a' : '#E2E8F0', fontWeight: c + 1 === d ? 700 : undefined }) }, v || '·')),
+            ce('td', { style: td({ fontWeight: 700 }) }, r.later ? Nf(r.later) : dash), ce('td', { style: td({ fontWeight: 700, color: '#0F766E' }) }, pc(r.later, r.L)),
+            ce('td', { style: td({ color: '#64748B' }) }, r.nod || dash)); }),
+          (() => { const w = mat.tRet - mat.tLater - mat.tNod; return ce('tr', { key: 'tot' },
+            ce('td', { style: td(fz(0, TOT, { textAlign: 'left', fontWeight: 700, bottom: 0, zIndex: 5 })) }, '∑ Total'),
+            ce('td', { style: td(fz(1, TOT, { fontWeight: 700, bottom: 0, zIndex: 5 })) }, Nf(mat.tL)), ce('td', { style: td(fz(2, TOT, { fontWeight: 700, bottom: 0, zIndex: 5 })) }, Nf(mat.tRet)),
+            ce('td', { style: td(fz(3, TOT, { fontWeight: 700, bottom: 0, zIndex: 5 })) }, w ? Nf(w) : dash), ce('td', { style: td(fz(4, TOT, { fontWeight: 700, bottom: 0, zIndex: 5, color: '#B01229' })) }, pc(w, mat.tL)),
+            ...mat.colTot.map((v, c) => ce('td', { key: c, style: td({ ...cw, ...tb }) }, v || dash)),
+            ce('td', { style: td(tb) }, mat.tLater ? Nf(mat.tLater) : dash), ce('td', { style: td({ ...tb, color: '#0F766E' }) }, pc(mat.tLater, mat.tL)),
+            ce('td', { style: td(tb) }, mat.tNod || dash)); })())));
+  }
+
+  const note = (t) => ce('div', { style: { padding: '7px 14px', background: '#EFF6FF', border: '1px solid #93C5FD', borderRadius: 8, fontSize: 12, color: '#1E3A8A', marginBottom: 12 } }, t);
+  return ce('div', { className: 'fade-up' },
+    note('ⓘ  Lead-creation basis: every lead month is followed through the months it retailed in, whatever the On Create / On Update switch says. Days from lead to retail use the day-level detail (latest 4 lead months); older months show the retail-month split only.'
+      + (cityOn ? ' City filter: leads follow Model, Source, State and City (Lead Type is not applied to leads).' : '')
+      + (has(filters.purchasedModels) ? ' Purch. Model: retails follow it, leads do not.' : '')),
+    ce('div', { className: 'card', style: { padding: '16px 18px', marginBottom: 14, borderTop: '3px solid #003087' } },
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' } },
+        ce('div', { className: 'section-title', style: { marginBottom: 0, flex: 1 } }, 'Lead to retail turnaround, by lead month'),
+        ce('button', { className: 'btn btn-secondary', style: { fontSize: 11 }, onClick: exportData }, '↓ Export Excel')),
+      ce('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 } },
+        kpi('Leads', Nf(summary.total.leads), '#003087'), kpi('Retailed', Nf(summary.total.ret), '#E31837'), kpi('Conversion', summary.total.conv.toFixed(1) + '%', '#B45309'),
+        kpi('Median', ov ? dInt(ov.med) : dash), kpi('Average', ov ? dAvg(ov.avg) : dash), kpi('90th percentile', ov ? dInt(ov.p90) : dash), kpi('Within 7 days', ov ? ov.w7.toFixed(0) + '%' : dash, '#16a34a')),
+      summaryTable,
+      ce('div', { className: 'fs-10', style: { color: '#64748B', marginTop: 8 } },
+        'Retailed = leads of that month that have retailed so far. Open = leads not retailed yet. Days columns are blank for months without day-level dates (before Jul’26); the Total row shows the days for the months that have them. Recent months look faster because leads that have not retailed yet are not counted. Months with days: ' + summary.tatMonths + '.')),
+    ce('div', { className: 'card', style: { padding: '16px 18px', marginBottom: 14, borderTop: '3px solid #0F766E' } },
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' } },
+        ce('div', { className: 'section-title', style: { marginBottom: 0, flex: 1 } }, 'Day by day: lead day (rows) x retail day (columns)'),
+        ce('select', { value: sel, onChange: e => setSel(e.target.value), style: { fontSize: 12, padding: '4px 8px', borderRadius: 6, border: '1px solid #CBD5E1' } },
+          ...opts.map(m => ce('option', { key: m, value: m }, m)))),
+      ce('div', { className: 'fs-10', style: { color: '#64748B', marginBottom: 8 } },
+        'Each row is a lead-creation day, each column the calendar day the retail was attributed. The grey cell marks the lead day itself (same-day retail). Within month and Later months are shares of that day\u2019s leads; Later months and retails without a date are on the right.'),
+      matrixEl));
+});
+
 const TABS = [
   { id:'overview',    label:'Overview' },
   { id:'daily',       label:'Day on Day' },
@@ -4047,6 +4337,7 @@ const TABS = [
   { id:'statusfunnel',label:'Status Funnel' },
   { id:'dispersion',  label:'Retail Dispersion' },
   { id:'pivot',       label:'Pivot Table' },
+  { id:'tat',         label:'Lead → Retail TAT' },
   { id:'ageing',      label:'Retail Ageing' },
 ];
 
@@ -4108,6 +4399,7 @@ function App() {
   const doFetch = useCallback(async () => {
     setLoading(true); setErr(null);
     try {
+      window.__jawaUniq = !!uniq;
       const parsed = await fetchData(uniq ? DATA_URL_UNIQUE : DATA_URL);
       setData(parsed);
       try { localStorage.setItem(CACHE_KEY+'_t', parsed.t); } catch(e) {}
@@ -4219,6 +4511,7 @@ function App() {
       case 'statusfunnel':return ce(StatusFunnelTab,    props);
       case 'dispersion':  return ce(DispersionTab,     props);
       case 'pivot':       return ce(PivotTab,          props);
+      case 'tat':         return ce(TatTab,            props);
       case 'ageing':      return ce(RetailAgeingTab,   props);
       default: return null;
     }

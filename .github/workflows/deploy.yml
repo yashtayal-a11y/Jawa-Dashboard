@@ -70,7 +70,7 @@ jobs:
           cp work/out/version.json _site/version.json
           # The New dashboards carry Source / Lead Type data. Published on the current (public) site by choice.
           cp work/out/new.html _site/new.html
-          mkdir -p _site/data && cp work/out/data/jawa_payload.json.gz work/out/data/jawa_payload_unique.json.gz _site/data/
+          mkdir -p _site/data && cp work/out/data/jawa_payload.json.gz work/out/data/jawa_payload_unique.json.gz work/out/data/jawa_daily.json.gz work/out/data/jawa_daily_unique.json.gz _site/data/
           ls -laR _site | head -20
 
       - name: Save live archive (encrypted)

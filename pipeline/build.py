@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from make_client import make_client
 import gzip
-from payload import build_payload
+from payload import build_payload, build_daily
 
 MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 LIVE_FROM = "May'26"
@@ -289,6 +289,8 @@ def main():
         u_leads.append(rep_pl)
         if rep_x['rm']: u_ret[rep_x['lid']] = p_ret[rep_x['lid']]
     payload_u = build_payload(u_leads, u_ret, built_iso)
+    daily, daily_u = build_daily(p_leads, p_ret, built_iso), build_daily(u_leads, u_ret, built_iso)
+    payload['uq'], payload_u['uq'] = 0, 1
     log(f"new-view unique payload: {len(u_leads):,} customers, {len(u_ret):,} retailed")
     log(f"new-view payload: {len(p_leads):,} leads, {len(p_ret):,} retails, ageing {payload['ram_meta']}")
 
@@ -329,6 +331,9 @@ def main():
         json.dump(payload, fh, separators=(',', ':'))
     with gzip.open(os.path.join(A.out, 'data', 'jawa_payload_unique.json.gz'), 'wt', encoding='utf-8', compresslevel=6) as fh:
         json.dump(payload_u, fh, separators=(',', ':'))
+    for nm, dd_ in (('jawa_daily', daily), ('jawa_daily_unique', daily_u)):
+        with gzip.open(os.path.join(A.out, 'data', nm + '.json.gz'), 'wt', encoding='utf-8', compresslevel=6) as fh:
+            json.dump(dd_, fh, separators=(',', ':'))
     newapp = open(os.path.join(HERE, 'new_app.html'), encoding='utf-8').read().replace('__BUILD_ID__', build_id)
     open(os.path.join(A.out, 'new.html'), 'w', encoding='utf-8').write(newapp)
 
